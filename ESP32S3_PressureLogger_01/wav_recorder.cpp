@@ -9,14 +9,57 @@
 #include <arduinoFFT.h>
 
 // ── FFT Analysis ──────────────────────────────────────────────────────────
-// 실제 샘플: 24000 (3sec × 8kHz), 2의 거듭제곱으로 제로패딩 → 32768 (2^15)
-#define FFT_SIZE          32768  // 2^15, zero-padded, freq resolution ~0.244 Hz
+#define FFT_SIZE          32768
 #define FFT_CAPTURE_SIZE  (WAV_RECORD_SECONDS * WAV_SAMPLE_RATE)  // 24000 samples
 
-// FFT 연산용: PSRAM 동적 할당
-// analyzeFFT()는 SD 읽기/FFT 모두 Core 1(loop)에서 실행 → 크로스 코어 캐시 문제 없음
 static float* fftReal = nullptr;
 static float* fftImag = nullptr;
+
+// ── Biquad IIR 필터 (Direct Form II Transposed) ────────────────────────────
+// 수치 안정성이 가장 우수한 구조 (누적 오차 최소)
+typedef struct {
+  float b0, b1, b2;  // feedforward 계수
+  float a1, a2;      // feedback 계수
+  float w1, w2;      // 내부 상태 (딜레이 레지스터)
+} Biquad_t;
+
+static inline float biquadProcess(Biquad_t* f, float x)
+{
+  float y = f->b0 * x + f->w1;
+  f->w1   = f->b1 * x - f->a1 * y + f->w2;
+  f->w2   = f->b2 * x - f->a2 * y;
+  return y;
+}
+
+// ── 대역통과 필터: 200Hz HP + 2000Hz LP (2차 Butterworth @ 8000Hz) ──────────
+// HP 200Hz: K=tan(π*200/8000)=0.07870, Q=0.7071
+// denom = 1 + K/Q + K² = 1.11746
+static Biquad_t hpFilter = {
+   0.89490f, -1.78980f,  0.89490f,   // b0, b1, b2
+  -1.77882f,  0.80089f,              // a1, a2
+   0.0f, 0.0f                        // w1, w2
+};
+
+// LP 2000Hz: K=tan(π*2000/8000)=1.0, Q=0.7071
+// denom = 1 + K/Q + K² = 3.41421
+static Biquad_t lpFilter = {
+   0.29289f,  0.58579f,  0.29289f,   // b0, b1, b2
+   0.00000f,  0.17157f,              // a1, a2
+   0.0f, 0.0f                        // w1, w2
+};
+
+// ── TPDF 디더링 (삼각형 PDF, LCG 난수) ────────────────────────────────────
+// 두 개의 1-bit 난수 합산 → [-1, 0, +1] 삼각분포 → 양자화 왜곡을 노이즈로 분산
+static uint32_t rngState = 0xDEADBEEFu;
+
+static inline float tpdfDither()
+{
+  rngState = rngState * 1664525u + 1013904223u;
+  int d1 = (int)(rngState >> 31);
+  rngState = rngState * 1664525u + 1013904223u;
+  int d2 = (int)(rngState >> 31);
+  return (float)(d1 - d2);   // -1, 0, or +1
+}
 
 // ── WAV State Machine ─────────────────────────────────────────────────────
 enum WavState { WAV_STANDBY, WAV_RECORDING, WAV_SAVING };
@@ -42,9 +85,18 @@ static esp_timer_handle_t wavEspTimer = NULL;
 static void wavTimerCb(void *arg)
 {
   int raw = analogRead(WAV_ADC_PIN);
-  int16_t sample = (int16_t)((raw - 2048) << 4);
+  float sample = (float)((raw - 2048) << 4);
 
-  wavBuf[wavFillBuf][wavFillPos] = sample;
+  // 1. 200Hz 하이패스 — DC 성분 및 저주파 진동 제거
+  sample = biquadProcess(&hpFilter, sample);
+  // 2. 2000Hz 로우패스 — 고주파 화이트노이즈 제거
+  sample = biquadProcess(&lpFilter, sample);
+  // 3. TPDF 디더링 — int16 재양자화 시 왜곡 분산
+  sample += tpdfDither();
+
+  int16_t pcm = (int16_t)constrain((long)sample, -32768L, 32767L);
+
+  wavBuf[wavFillBuf][wavFillPos] = pcm;
   wavISRCount++;
 
   if (++wavFillPos >= WAV_BUF_SAMPLES)
@@ -54,6 +106,66 @@ static void wavTimerCb(void *arg)
     wavFillBuf ^= 1;
     wavFillPos  = 0;
   }
+}
+
+// 전방 선언 (normalizeWavFile이 writeWavHeader보다 앞에 위치하므로)
+static void writeWavHeader(File &f, uint32_t dataSize);
+
+// ── 정규화: WAV 파일 2-pass 처리 (Peak → Gain → 재기록) ──────────────────
+static void normalizeWavFile()
+{
+  if (!fftReal) { Serial.println("[NORM] Buffer not ready"); return; }
+
+  // Pass 1: 피크 탐색
+  File f = SD_MMC.open(wavFileName, FILE_READ);
+  if (!f) { Serial.printf("[NORM] Open failed: %s\n", wavFileName); return; }
+  f.seek(44);
+
+  uint32_t count  = 0;
+  int16_t  peak   = 0;
+  int16_t  s;
+  while (f.read((uint8_t*)&s, 2) == 2 && count < (uint32_t)FFT_CAPTURE_SIZE)
+  {
+    fftReal[count++] = (float)s;
+    int16_t a = (s < 0) ? -s : s;
+    if (a > peak) peak = a;
+  }
+  f.close();
+
+  if (peak < 64)
+  {
+    Serial.println("[NORM] Signal too weak, skip normalization");
+    return;
+  }
+
+  // 목표: -1 dBFS (= 32767 × 10^(-1/20) ≈ 29204)
+  const float TARGET = 29204.0f;
+  float gain = TARGET / (float)peak;
+  Serial.printf("[NORM] Peak: %d  Gain: %.3f (%+.1f dB)\n",
+    peak, gain, 20.0f * log10f(gain));
+
+  // Pass 2: 게인 적용 → 파일 재기록
+  for (uint32_t i = 0; i < count; i++)
+    fftReal[i] *= gain;
+
+  File fw = SD_MMC.open(wavFileName, FILE_WRITE);
+  if (!fw) { Serial.println("[NORM] Rewrite open failed"); return; }
+
+  writeWavHeader(fw, count * 2);
+
+  int16_t normBuf[256];
+  uint32_t written = 0;
+  while (written < count)
+  {
+    uint32_t chunk = min((uint32_t)256, count - written);
+    for (uint32_t i = 0; i < chunk; i++)
+      normBuf[i] = (int16_t)constrain((long)fftReal[written + i], -32768L, 32767L);
+    fw.write((const uint8_t*)normBuf, chunk * 2);
+    written += chunk;
+  }
+  fw.flush();
+  fw.close();
+  Serial.printf("[NORM] Done: %u samples normalized\n", count);
 }
 
 // ── FFT Peak Frequency Analysis ───────────────────────────────────────────
@@ -219,6 +331,12 @@ static void wavStartRecording(bool sd)
   wavFillPos  = 0;
   wavFlushReq = false;
   wavISRCount = 0;
+
+  // 필터 상태 초기화 (이전 녹음의 과도 응답 차단)
+  hpFilter.w1 = hpFilter.w2 = 0.0f;
+  lpFilter.w1 = lpFilter.w2 = 0.0f;
+  rngState = (uint32_t)esp_timer_get_time();  // 디더 난수 시드
+
   wavState    = WAV_RECORDING;
   ledSetState(LED_LOGGING);
 
@@ -257,7 +375,8 @@ static void wavStopRecording(bool sd)
   }
 
   closeWavFile();
-  analyzeFFT();               // WAV 저장 완료 후 FFT 주파수 분석
+  normalizeWavFile();         // 정규화: 피크 탐색 → 게인 적용 → 재기록
+  analyzeFFT();               // 정규화된 파일로 FFT 주파수 분석
   wavState = WAV_STANDBY;
   ledSetState(LED_BOOTING);   // white = standby
   Serial.println("[WAV] Standby. Press BOOT button to record.");
