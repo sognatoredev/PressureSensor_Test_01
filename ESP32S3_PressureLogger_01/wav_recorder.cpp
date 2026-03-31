@@ -9,11 +9,14 @@
 #include <arduinoFFT.h>
 
 // ── FFT Analysis ──────────────────────────────────────────────────────────
-#define FFT_SIZE  8192  // 2^13, ~1.024 sec @ 8kHz, freq resolution ~0.977 Hz
+// 실제 샘플: 24000 (3sec × 8kHz), 2의 거듭제곱으로 제로패딩 → 32768 (2^15)
+#define FFT_SIZE          32768  // 2^15, zero-padded, freq resolution ~0.244 Hz
+#define FFT_CAPTURE_SIZE  (WAV_RECORD_SECONDS * WAV_SAMPLE_RATE)  // 24000 samples
 
-static float     fftReal[FFT_SIZE];
-static float     fftImag[FFT_SIZE];
-static uint32_t  fftSampleIdx = 0;
+// FFT 연산용: PSRAM 동적 할당
+// analyzeFFT()는 SD 읽기/FFT 모두 Core 1(loop)에서 실행 → 크로스 코어 캐시 문제 없음
+static float* fftReal = nullptr;
+static float* fftImag = nullptr;
 
 // ── WAV State Machine ─────────────────────────────────────────────────────
 enum WavState { WAV_STANDBY, WAV_RECORDING, WAV_SAVING };
@@ -44,10 +47,6 @@ static void wavTimerCb(void *arg)
   wavBuf[wavFillBuf][wavFillPos] = sample;
   wavISRCount++;
 
-  // FFT 분석용 샘플 캡처 (FFT_SIZE 개까지만)
-  if (fftSampleIdx < FFT_SIZE)
-    fftReal[fftSampleIdx++] = (float)sample;
-
   if (++wavFillPos >= WAV_BUF_SAMPLES)
   {
     wavFlushBuf = wavFillBuf;
@@ -58,41 +57,65 @@ static void wavTimerCb(void *arg)
 }
 
 // ── FFT Peak Frequency Analysis ───────────────────────────────────────────
+// SD 파일에서 직접 읽기 → Core 1에서만 접근 → 코어 간 캐시 문제 없음
+// 윈도우는 실제 신호 구간(FFT_CAPTURE_SIZE)에만 수동 적용 후 제로패딩
 static void analyzeFFT()
 {
-  if (fftSampleIdx < FFT_SIZE)
+  if (!fftReal || !fftImag)
   {
-    Serial.printf("[FFT] Not Enable Sample (%u / %u)\n", fftSampleIdx, FFT_SIZE);
+    Serial.println("[FFT] Buffer not ready, skipping.");
     return;
   }
 
-  memset(fftImag, 0, sizeof(fftImag));
+  // WAV 파일 열기 (헤더 44바이트 스킵 후 PCM 샘플 읽기)
+  File f = SD_MMC.open(wavFileName, FILE_READ);
+  if (!f)
+  {
+    Serial.printf("[FFT] Cannot open %s\n", wavFileName);
+    return;
+  }
+  f.seek(44);
 
+  // SD → fftReal (int16_t → float), DC 평균 동시 계산
+  float mean = 0.0f;
+  for (uint32_t i = 0; i < FFT_CAPTURE_SIZE; i++)
+  {
+    int16_t s = 0;
+    f.read((uint8_t*)&s, 2);
+    fftReal[i] = (float)s;
+    mean += fftReal[i];
+  }
+  f.close();
+  mean /= (float)FFT_CAPTURE_SIZE;
+
+  // DC 제거 + Hamming 윈도우를 실제 신호 구간에만 적용
+  for (uint32_t i = 0; i < FFT_CAPTURE_SIZE; i++)
+  {
+    fftReal[i] -= mean;
+    fftReal[i] *= 0.54f - 0.46f * cosf(TWO_PI * i / (float)(FFT_CAPTURE_SIZE - 1));
+  }
+
+  // 제로패딩 (FFT_CAPTURE_SIZE ~ FFT_SIZE-1)
+  memset(&fftReal[FFT_CAPTURE_SIZE], 0,
+    (FFT_SIZE - FFT_CAPTURE_SIZE) * sizeof(float));
+  memset(fftImag, 0, FFT_SIZE * sizeof(float));
+
+  // FFT 계산 (windowing은 이미 수동 적용했으므로 호출 안 함)
   ArduinoFFT<float> FFT(fftReal, fftImag, FFT_SIZE, (float)WAV_SAMPLE_RATE);
-  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
   FFT.compute(FFTDirection::Forward);
   FFT.complexToMagnitude();
 
-  // DC(bin 0) 제외하고 최대 크기 빈 탐색
-  float    maxMag   = 0.0f;
-  uint32_t peakBin  = 1;
-  for (uint32_t i = 1; i < FFT_SIZE / 2; i++)
-  {
-    if (fftReal[i] > maxMag)
-    {
-      maxMag  = fftReal[i];
-      peakBin = i;
-    }
-  }
+  // majorPeak(): 내장 이차보간으로 bin 경계 사이 정확한 주파수 계산
+  float peakFreq = FFT.majorPeak();
 
-  float peakFreq = (float)peakBin * (float)WAV_SAMPLE_RATE / (float)FFT_SIZE;
   Serial.println("─────────────────────────────────");
-  Serial.printf("[FFT] Section : %.3f sec (%u samples)\n",
-    (float)FFT_SIZE / (float)WAV_SAMPLE_RATE, FFT_SIZE);
+  Serial.printf("[FFT] Signal   : %u samples (%.3f sec)\n",
+    FFT_CAPTURE_SIZE, (float)FFT_CAPTURE_SIZE / WAV_SAMPLE_RATE);
+  Serial.printf("[FFT] Zero-pad : %u → %u\n", FFT_CAPTURE_SIZE, FFT_SIZE);
   Serial.printf("[FFT] Freq Resolution : %.3f Hz/bin\n",
     (float)WAV_SAMPLE_RATE / (float)FFT_SIZE);
-  Serial.printf("[FFT] Max Freq : %.1f Hz  (bin %u, magnitude %.0f)\n",
-    peakFreq, peakBin, maxMag);
+  Serial.printf("[FFT] DC Offset removed : %.1f\n", mean);
+  Serial.printf("[FFT] Peak Freq : %.2f Hz\n", peakFreq);
   Serial.println("─────────────────────────────────");
 }
 
@@ -192,12 +215,11 @@ static void wavStartRecording(bool sd)
   if (!sd) { Serial.println("[WAV] SD not ready"); return; }
   if (!openNewWavFile()) return;
 
-  wavFillBuf   = 0;
-  wavFillPos   = 0;
-  wavFlushReq  = false;
-  wavISRCount  = 0;
-  fftSampleIdx = 0;     // FFT 버퍼 초기화
-  wavState     = WAV_RECORDING;
+  wavFillBuf  = 0;
+  wavFillPos  = 0;
+  wavFlushReq = false;
+  wavISRCount = 0;
+  wavState    = WAV_RECORDING;
   ledSetState(LED_LOGGING);
 
   esp_timer_start_periodic(wavEspTimer, 125);   // 8000 Hz = 125 μs
@@ -244,6 +266,16 @@ static void wavStopRecording(bool sd)
 // ── Public API ────────────────────────────────────────────────────────────
 void wavRecorderInit()
 {
+  // FFT 버퍼를 PSRAM에 동적 할당 (Core 1에서만 접근하므로 캐시 문제 없음)
+  fftReal = (float*)heap_caps_malloc(FFT_SIZE * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  fftImag = (float*)heap_caps_malloc(FFT_SIZE * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  if (!fftReal || !fftImag)
+    Serial.println("[FFT] PSRAM alloc failed!");
+  else
+    Serial.printf("[FFT] PSRAM alloc OK: %u KB\n",
+      (uint32_t)(FFT_SIZE * sizeof(float) * 2 / 1024));
+
   analogSetPinAttenuation(WAV_ADC_PIN, ADC_11db);
   pinMode(WAV_ADC_PIN,     INPUT);
   pinMode(WAV_TRIGGER_PIN, INPUT_PULLUP);
