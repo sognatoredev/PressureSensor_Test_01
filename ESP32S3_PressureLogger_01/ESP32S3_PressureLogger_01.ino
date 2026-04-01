@@ -12,11 +12,15 @@
  *  Pin Wiring  (Freenove ESP32-S3 WROOM, camera not used)
  * ──────────────────────────────────────────────────────────────
  *  Function      ESP32-S3 GPIO   → Target
- *  I2C SDA       GPIO 21         → Digital Sensor SDA
- *  I2C SCL       GPIO 20         → Digital Sensor SCL
- *  ADC IN        GPIO 4          → Analog Pressure Sensor VOUT  (ADC1 CH3)
- *  ADC IN        GPIO 1          → MAX4466 OUT (Piezo preamp)   (ADC1 CH0)
- *  TRIGGER       GPIO 0          → BOOT button (built-in, active LOW)
+ *  I2C SDA       GPIO 21         → Digital Sensor SDA / NAU88 SDA (Type 0/3)
+ *  I2C SCL       GPIO 20         → Digital Sensor SCL / NAU88 SCL (Type 0/3)
+ *  ADC IN        GPIO 4          → Analog Pressure Sensor VOUT  (ADC1 CH3, Type 1)
+ *  ADC IN        GPIO 1          → MAX4466 OUT (Piezo preamp)   (ADC1 CH0, Type 2)
+ *  I2S MCLK      GPIO 8          → NAU88 MCLK  (256×fs, Type 3)
+ *  I2S BCLK      GPIO 5          → NAU88 BCLK  (Type 3)
+ *  I2S LRCLK     GPIO 6          → NAU88 LRC   (Type 3)
+ *  I2S DIN       GPIO 7          ← NAU88 ADCOUT (Type 3)
+ *  TRIGGER       GPIO 0          → BOOT button (built-in, active LOW, Type 2/3)
  *  SD CMD        GPIO 38         → MicroSD CMD
  *  SD D0         GPIO 40         → MicroSD DATA
  *  SD CLK        GPIO 39         → MicroSD CLK
@@ -27,12 +31,14 @@
  * Sensor selection (SENSOR_TYPE in config.h):
  *   0 = I2C digital sensor only  (WNK)
  *   1 = ADC analog pressure sensor only
- *   2 = Piezo vibration WAV recorder (triggered by BOOT button)
+ *   2 = Piezo vibration WAV recorder (ADC, triggered by BOOT button)
+ *   3 = Piezo vibration WAV recorder (NAU88C10YG codec via I2S, triggered by BOOT button)
  *
  * Required libraries:
  *   - SD_MMC, Wire, WiFi (ESP32 built-in)
  *   - Adafruit NeoPixel
  *   - esp_timer.h (ESP-IDF built-in) [SENSOR_TYPE=2]
+ *   - driver/i2s.h  (ESP-IDF built-in) [SENSOR_TYPE=3]
  */
 
 #include "config.h"
@@ -48,6 +54,8 @@
   #include "sensor_adc.h"
 #elif SENSOR_TYPE == 2
   #include "wav_recorder.h"
+#elif SENSOR_TYPE == 3
+  #include "wav_recorder_codec.h"
 #endif
 
 static bool sensorReady = false;
@@ -57,7 +65,7 @@ static MovingAvgFilter_t pressureFilter;
 static MovingAvgFilter_t temperatureFilter;
 #elif SENSOR_TYPE == 1
 static MovingAvgFilter_t pressureFilter;
-#endif
+#endif  // SENSOR_TYPE 2/3: 필터 불필요 (코덱/ADC 녹음기가 자체 처리)
 
 // ==================== Setup ====================
 void setup()
@@ -70,9 +78,14 @@ void setup()
 
   Serial.println("=========================================");
 #if SENSOR_TYPE == 2
-  Serial.println("  Piezo Vibration WAV Recorder");
+  Serial.println("  Piezo Vibration WAV Recorder (ADC)");
   Serial.printf ("  %d Hz · 16-bit PCM Mono · %d sec/file\n",
     WAV_SAMPLE_RATE, WAV_RECORD_SECONDS);
+  Serial.println("  Press BOOT button (GPIO0) to record");
+#elif SENSOR_TYPE == 3
+  Serial.println("  Piezo Vibration WAV Recorder (NAU88C10YG Codec / I2S)");
+  Serial.printf ("  %d Hz · 16-bit PCM Mono · %d sec/file\n",
+    NAU88_SAMPLE_RATE, NAU88_RECORD_SECONDS);
   Serial.println("  Press BOOT button (GPIO0) to record");
 #else
   Serial.println("  WNK/ADC Pressure Sensor Data Logger");
@@ -111,15 +124,18 @@ void setup()
 #elif SENSOR_TYPE == 2
   wavRecorderInit();
   sensorReady = true;
+#elif SENSOR_TYPE == 3
+  codecRecorderInit();
+  sensorReady = true;
 #endif
 
   // ── NTP time sync ─────────────────────────────────────────────────────────
   syncNTP();
 
   // ── SD card init ──────────────────────────────────────────────────────────
-  if (sdInit()) 
+  if (sdInit())
   {
-    #if SENSOR_TYPE == 2
+    #if SENSOR_TYPE == 2 || SENSOR_TYPE == 3
         // WAV 파일은 녹음 시작 시 on-demand 생성
     #else
         if (!openNewLogFile()) sdReady = false;
@@ -132,7 +148,7 @@ void setup()
   else                   ledSetState(LED_BOOTING);
 
   Serial.println();
-#if SENSOR_TYPE == 2
+#if SENSOR_TYPE == 2 || SENSOR_TYPE == 3
   Serial.println(">>> Standby. Press BOOT button to record.");
 #elif SENSOR_TYPE == 1
   Serial.println("timestamp_ms | datetime                 | ADC_raw   | ADC_raw_avg");
@@ -149,14 +165,18 @@ void loop()
   ledUpdate();
   unsigned long now = millis();
 
-  // ── SENSOR_TYPE 2: WAV triggered recorder ─────────────────────────────
-#if SENSOR_TYPE == 2
+  // ── SENSOR_TYPE 2/3: WAV triggered recorder ───────────────────────────
+#if SENSOR_TYPE == 2 || SENSOR_TYPE == 3
   if (!sensorReady)
   {
     return;
   }
-  
+
+#if SENSOR_TYPE == 2
   wavLoop(sdReady, now);
+#else
+  codecLoop(sdReady, now);
+#endif
   return;
 #endif
 
