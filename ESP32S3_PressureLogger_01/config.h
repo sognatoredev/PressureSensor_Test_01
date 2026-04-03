@@ -55,11 +55,12 @@
 #define NAU88_I2S_DIN_PIN    46    // Data input         ← NAU88 ADCOUT  (GPIO46: 입력 전용 strapping)
 
 #define NAU88_TRIGGER_PIN    0     // BOOT button (active LOW) — same as SENSOR_TYPE 2
-#define NAU88_SAMPLE_RATE    8000  // 8 kHz (MCLK = 256 × 8000 = 2.048 MHz)
+// #define NAU88_SAMPLE_RATE    44100 // 44.1 kHz (MCLK = 256 × 44100 = 11.2896 MHz, APLL)
+#define NAU88_SAMPLE_RATE    8000 // 44.1 kHz (MCLK = 256 × 44100 = 11.2896 MHz, APLL)
 #define NAU88_RECORD_SECONDS 3     // recording length per file
 #define NAU88_BUF_SAMPLES    4096  // double-buffer size (samples per half)
 
-// ==================== SD Card Pins (SDMMC 1-bit) ====================
+// ==================== SD Card Pins (SDMMC 1-bit) ====================          
 #define SD_CMD_PIN        38
 #define SD_D0_PIN         40
 #define SD_CLK_PIN        39
