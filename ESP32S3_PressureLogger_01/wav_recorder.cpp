@@ -9,8 +9,8 @@
 #include <arduinoFFT.h>
 
 // ── FFT Analysis ──────────────────────────────────────────────────────────
-#define FFT_SIZE          32768
-#define FFT_CAPTURE_SIZE  (WAV_RECORD_SECONDS * WAV_SAMPLE_RATE)  // 24000 samples
+#define FFT_SIZE          262144  // 2^18 ≥ 44100×3=132300 samples (zero-padding)
+#define FFT_CAPTURE_SIZE  (WAV_RECORD_SECONDS * WAV_SAMPLE_RATE)  // 132300 samples @ 44.1kHz
 
 static float* fftReal = nullptr;
 static float* fftImag = nullptr;
@@ -31,20 +31,20 @@ static inline float biquadProcess(Biquad_t* f, float x)
   return y;
 }
 
-// ── 대역통과 필터: 200Hz HP + 2000Hz LP (2차 Butterworth @ 8000Hz) ──────────
-// HP 200Hz: K=tan(π*200/8000)=0.07870, Q=0.7071
-// denom = 1 + K/Q + K² = 1.11746
+// ── 대역통과 필터: 200Hz HP + 2000Hz LP (2차 Butterworth @ 44100Hz) ──────────
+// HP 200Hz: K=tan(π*200/44100)=0.014265, Q=0.7071
+// denom = 1 + K/Q + K² = 1.020377
 static Biquad_t hpFilter = {
-   0.89490f, -1.78980f,  0.89490f,   // b0, b1, b2
-  -1.77882f,  0.80089f,              // a1, a2
+   0.98003f, -1.96006f,  0.98003f,   // b0, b1, b2
+  -1.95968f,  0.96045f,              // a1, a2
    0.0f, 0.0f                        // w1, w2
 };
 
-// LP 2000Hz: K=tan(π*2000/8000)=1.0, Q=0.7071
-// denom = 1 + K/Q + K² = 3.41421
+// LP 2000Hz: K=tan(π*2000/44100)=0.14312, Q=0.7071
+// denom = 1 + K/Q + K² = 1.22290
 static Biquad_t lpFilter = {
-   0.29289f,  0.58579f,  0.29289f,   // b0, b1, b2
-   0.00000f,  0.17157f,              // a1, a2
+   0.01676f,  0.03351f,  0.01676f,   // b0, b1, b2
+  -1.60216f,  0.66895f,              // a1, a2
    0.0f, 0.0f                        // w1, w2
 };
 
@@ -217,6 +217,13 @@ static void analyzeFFT()
   FFT.compute(FFTDirection::Forward);
   FFT.complexToMagnitude();
 
+  // 전기 노이즈 대역(59~61 Hz) 제거 — peak 탐색에서 제외
+  {
+    uint32_t binLow  = (uint32_t)(59.0f * FFT_SIZE / WAV_SAMPLE_RATE);
+    uint32_t binHigh = (uint32_t)(61.0f * FFT_SIZE / WAV_SAMPLE_RATE) + 1;
+    for (uint32_t b = binLow; b <= binHigh; b++) fftReal[b] = 0.0f;
+  }
+
   // majorPeak(): 내장 이차보간으로 bin 경계 사이 정확한 주파수 계산
   float peakFreq = FFT.majorPeak();
 
@@ -340,7 +347,7 @@ static void wavStartRecording(bool sd)
   wavState    = WAV_RECORDING;
   ledSetState(LED_LOGGING);
 
-  esp_timer_start_periodic(wavEspTimer, 125);   // 8000 Hz = 125 μs
+  esp_timer_start_periodic(wavEspTimer, 22);    // ~45.5kHz (1000000/22≈45454 Hz, ADC 타이머 한계)
   Serial.printf("[WAV] Recording %d sec → %s\n", WAV_RECORD_SECONDS, wavFileName);
 }
 

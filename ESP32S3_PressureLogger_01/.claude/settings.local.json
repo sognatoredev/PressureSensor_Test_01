@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import numpy, scipy, matplotlib; print\\(''All libs OK''\\)\")",
+      "Bash(pip install:*)"
+    ]
+  }
+}

@@ -35,7 +35,7 @@
 // ==================== Piezo WAV Recorder (SENSOR_TYPE 2) ====================
 #define WAV_ADC_PIN         1  // GPIO1 = ADC1 CH0 (MAX4466 output)
 #define WAV_TRIGGER_PIN     0  // GPIO0 = BOOT button (active LOW)
-#define WAV_SAMPLE_RATE     8000
+#define WAV_SAMPLE_RATE     44100
 #define WAV_RECORD_SECONDS  3
 #define WAV_BUF_SAMPLES     4096
 
