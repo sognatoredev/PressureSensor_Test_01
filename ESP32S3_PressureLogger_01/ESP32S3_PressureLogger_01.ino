@@ -61,8 +61,9 @@
 //   2 = Piezo vibration WAV recorder (button-triggered)
 #define SENSOR_TYPE        2
 
-const char* WIFI_SSID     = "KT_GiGA_9748";
-const char* WIFI_PASSWORD = "9cf0bkd529";
+// const char* WIFI_SSID     = "KT_GiGA_9748";
+const char* WIFI_SSID     = "U+Net8A70";
+const char* WIFI_PASSWORD = "74EF8H6#00";
 
 // Sampling interval (ms) — SENSOR_TYPE 0/1 only
 #define SAMPLE_INTERVAL_MS   10
@@ -104,6 +105,33 @@ const char* WIFI_PASSWORD = "9cf0bkd529";
 #define WAV_RECORD_SECONDS  3           // Seconds per triggered recording
 #define WAV_BUF_SAMPLES     4096        // Samples per double-buffer half (~512 ms)
 
+// ── Bandpass Filter (200 Hz – 2000 Hz) ────────────────────────────────────
+//  Cascaded 2nd-order Butterworth biquad sections (Direct Form II)
+//  fs = 8000 Hz
+//  Section 1: High-pass  fc = 200 Hz  → removes DC / low-freq rumble
+//  Section 2: Low-pass   fc = 2000 Hz → removes high-freq noise / aliasing
+//
+//  Difference equation (a0 normalised to 1):
+//    y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] − a1·y[n-1] − a2·y[n-2]
+//
+//  Coefficients computed with bilinear transform + pre-warping.
+//
+#define WAV_BANDPASS_FILTER   1         // 1 = enable, 0 = bypass (raw ADC)
+
+// High-pass  fc=200 Hz, fs=8000 Hz, Q=1/√2
+#define HP_B0  0.89354f
+#define HP_B1 (-1.78708f)
+#define HP_B2  0.89354f
+#define HP_A1 (-1.77626f)
+#define HP_A2  0.79852f
+
+// Low-pass   fc=2000 Hz, fs=8000 Hz, Q=1/√2
+#define LP_B0  0.29289f
+#define LP_B1  0.58579f
+#define LP_B2  0.29289f
+#define LP_A1  0.00000f
+#define LP_A2  0.17157f
+
 // ==================== SD Card Pins (SDMMC 1-bit) ====================
 #define SD_CMD_PIN        38
 #define SD_D0_PIN         40
@@ -118,6 +146,21 @@ typedef struct {
   uint8_t count;
   float   sum;
 } MovingAvgFilter_t;
+
+// ==================== Biquad IIR Filter ====================
+// Placed here (outside #if blocks) so Arduino's auto-prototype generator
+// can find BiquadState_t before it emits forward declarations.
+
+typedef struct { float x1, x2, y1, y2; } BiquadState_t;
+
+static inline float applyBiquad(BiquadState_t *s,
+  float b0, float b1, float b2, float a1, float a2, float x)
+{
+  float y = b0*x + b1*s->x1 + b2*s->x2 - a1*s->y1 - a2*s->y2;
+  s->x2 = s->x1;  s->x1 = x;
+  s->y2 = s->y1;  s->y1 = y;
+  return y;
+}
 
 // ==================== RGB LED (WS2812B - GPIO48) ====================
 #define RGB_LED_PIN       48
@@ -224,6 +267,10 @@ int readAdcRaw() { return analogRead(ADC_PRESSURE_PIN); }
 // ==================== Piezo WAV Recorder (SENSOR_TYPE 2) ====================
 #if SENSOR_TYPE == 2
 
+// ── Biquad filter states (defined globally in Biquad IIR Filter section) ──
+static BiquadState_t bqHP = {0,0,0,0};   // High-pass  200 Hz
+static BiquadState_t bqLP = {0,0,0,0};   // Low-pass  2000 Hz
+
 // ── WAV State Machine ──────────────────────────────────────────────────────
 enum WavState { WAV_STANDBY, WAV_RECORDING, WAV_SAVING };
 static WavState wavState = WAV_STANDBY;
@@ -250,7 +297,18 @@ static esp_timer_handle_t wavEspTimer = NULL;
 static void wavTimerCb(void *arg)
 {
   int raw = analogRead(WAV_ADC_PIN);              // GPIO1, 12-bit 0~4095
-  int16_t sample = (int16_t)((raw - 2048) << 4); // center + scale → 16-bit signed
+  float fsamp = (float)(raw - 2048);              // center: -2048 ~ +2047
+
+#if WAV_BANDPASS_FILTER
+  fsamp = applyBiquad(&bqHP, HP_B0, HP_B1, HP_B2, HP_A1, HP_A2, fsamp); // HP 200Hz
+  fsamp = applyBiquad(&bqLP, LP_B0, LP_B1, LP_B2, LP_A1, LP_A2, fsamp); // LP 2000Hz
+#endif
+
+  // Scale to 16-bit signed; clamp to avoid overflow after filtering
+  float scaled = fsamp * 16.0f;
+  if (scaled >  32767.0f) scaled =  32767.0f;
+  if (scaled < -32768.0f) scaled = -32768.0f;
+  int16_t sample = (int16_t)scaled;
 
   wavBuf[wavFillBuf][wavFillPos] = sample;
   wavISRCount++;
@@ -339,6 +397,10 @@ void wavStartRecording(bool sd)
   wavFlushReq = false;
   wavISRCount = 0;
   wavState    = WAV_RECORDING;
+
+  // Reset bandpass filter states (prevent transient from previous recording)
+  bqHP = {0,0,0,0};
+  bqLP = {0,0,0,0};
   ledSetState(LED_LOGGING);
 
   // Start 8000 Hz periodic callback (125 μs interval)
