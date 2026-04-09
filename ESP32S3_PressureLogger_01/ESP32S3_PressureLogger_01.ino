@@ -46,6 +46,7 @@
 #include "filter.h"
 #include "time_manager.h"
 #include "sd_logger.h"
+#include "lte_simcom.h"
 
 #if SENSOR_TYPE == 0
   #include <Wire.h>
@@ -147,6 +148,22 @@ void setup()
   else if (!sensorReady) ledSetState(LED_SENSOR_ERROR);
   else                   ledSetState(LED_BOOTING);
 
+  // ── LTE ──────────────────────────────────────────────────────────────────
+#if USE_LTE
+#if LTE_PASSTHROUGH
+  // AT 패스스루 모드: UART만 초기화, 자동 시퀀스 없음
+  ltePassthroughBegin();
+#else
+  // 정상 모드: 초기화 후 서버 연결 확인
+  {
+    char lteBuf[256] = {0};
+    if (lteInit()) {
+      lteHttpGet(LTE_GET_PATH, lteBuf, sizeof(lteBuf));
+    }
+  }
+#endif // LTE_PASSTHROUGH
+#endif // USE_LTE
+
   Serial.println();
 #if SENSOR_TYPE == 2 || SENSOR_TYPE == 3
   Serial.println(">>> Standby. Press BOOT button to record.");
@@ -163,6 +180,12 @@ void setup()
 void loop()
 {
   ledUpdate();
+
+#if USE_LTE && LTE_PASSTHROUGH
+  ltePassthroughLoop();
+  return;
+#endif
+
   unsigned long now = millis();
 
   // ── SENSOR_TYPE 2/3: WAV triggered recorder ───────────────────────────

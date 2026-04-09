@@ -60,7 +60,24 @@
 #define NAU88_RECORD_SECONDS 3     // recording length per file
 #define NAU88_BUF_SAMPLES    4096  // double-buffer size (samples per half)
 
-// ==================== SD Card Pins (SDMMC 1-bit) ====================          
+// ==================== LTE (SIMCOM7000) ====================
+// LTE_PASSTHROUGH=1: AT 커맨드 터미널 모드 (Serial Monitor ↔ SIM7000 직결)
+//   Serial Monitor 설정: 115200 baud, "Both NL & CR" 또는 "Newline"
+//   이 모드에서는 lteInit() 등 자동 시퀀스를 건너뛰고 패스스루만 동작합니다.
+#define LTE_PASSTHROUGH     0
+// 사용 중인 핀: 0,1,2,14,20,21,38,39,40,46,48 → 17/18 미사용 확인
+#define USE_LTE             1
+#define LTE_TX_PIN          17    // ESP32 TX → SIMCOM7000 RXD
+#define LTE_RX_PIN          18    // ESP32 RX ← SIMCOM7000 TXD
+#define LTE_PWRKEY_PIN      4     // ESP32 GPIO4 → SIMCOM7000 PWRKEY (active LOW pulse)
+#define LTE_BAUD            115200
+#define LTE_APN             "em"
+#define LTE_SERVER_HOST     "dev.neverlosewater.com"
+#define LTE_SERVER_PORT     49152
+#define LTE_SERIAL_NO       "SM2-V3A-6000"
+#define LTE_GET_PATH        "/m2/device_setting?serial_no=" LTE_SERIAL_NO
+
+// ==================== SD Card Pins (SDMMC 1-bit) ====================
 #define SD_CMD_PIN        38
 #define SD_D0_PIN         40
 #define SD_CLK_PIN        39
