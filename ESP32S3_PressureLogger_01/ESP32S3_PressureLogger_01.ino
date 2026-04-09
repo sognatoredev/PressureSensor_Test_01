@@ -146,7 +146,7 @@ void setup()
   // ── Final LED ─────────────────────────────────────────────────────────────
   if      (!sdReady)     ledSetState(LED_SD_ERROR);
   else if (!sensorReady) ledSetState(LED_SENSOR_ERROR);
-  else                   ledSetState(LED_BOOTING);
+  else                   ledSetState(LED_IDLE);
 
   // ── LTE ──────────────────────────────────────────────────────────────────
 #if USE_LTE
