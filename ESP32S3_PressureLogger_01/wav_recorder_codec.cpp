@@ -46,12 +46,14 @@ static int16_t  codecPcmMin     = 0;
 static int16_t  codecPcmMax     = 0;
 static uint32_t codecNonZero    = 0;   // 0이 아닌 샘플 수
 
-// ── FFT 버퍼 (PSRAM 동적 할당) ────────────────────────────────────────────
+// ── 오프라인 FFT 버퍼 (PSRAM 동적 할당) ──────────────────────────────────
+//   CODEC_FFT_SIZE = 32768 (2^15): 제로패딩 후 FFT 포인트 수
+//   fftReal / fftImag 각 128 KB → 합계 256 KB PSRAM
 #define CODEC_FFT_SIZE         32768
 #define CODEC_FFT_CAPTURE_SIZE (NAU88_RECORD_SECONDS * NAU88_SAMPLE_RATE)
 
-static float*   fftReal  = nullptr;
-static float*   fftImag  = nullptr;
+static float*   fftReal = nullptr;  // PSRAM: 실수부 (128 KB)
+static float*   fftImag = nullptr;  // PSRAM: 허수부 (128 KB)
 
 // ── 원 데이터 버퍼 (필터 적용 전 I2S 원본, PSRAM) ──────────────────────────
 static int16_t* rawBuf    = nullptr;  // PSRAM: CODEC_FFT_CAPTURE_SIZE × 2 bytes
@@ -313,6 +315,7 @@ static void writeWavHeader(File &f, uint32_t dataBytes);  // 전방 선언
 static void normalizeWavFile()
 {
   if (!fftReal) { Serial.println("[NORM] Buffer not ready"); return; }
+  float* normF = fftReal;
 
   File f = SD_MMC.open(codecFileName, FILE_READ);
   if (!f) { Serial.printf("[NORM] Open failed: %s\n", codecFileName); return; }
@@ -323,7 +326,7 @@ static void normalizeWavFile()
   int16_t  s;
   while (f.read((uint8_t*)&s, 2) == 2 && count < (uint32_t)CODEC_FFT_CAPTURE_SIZE)
   {
-    fftReal[count++] = (float)s;
+    normF[count++] = (float)s;
     int16_t a = (s < 0) ? -s : s;
     if (a > peak) peak = a;
   }
@@ -337,7 +340,7 @@ static void normalizeWavFile()
     peak, gain, 20.0f * log10f(gain));
 
   for (uint32_t i = 0; i < count; i++)
-    fftReal[i] *= gain;
+    normF[i] *= gain;
 
   File fw = SD_MMC.open(codecFileName, FILE_WRITE);
   if (!fw) { Serial.println("[NORM] Rewrite open failed"); return; }
@@ -350,7 +353,7 @@ static void normalizeWavFile()
   {
     uint32_t chunk = min((uint32_t)256, count - written);
     for (uint32_t i = 0; i < chunk; i++)
-      normBuf[i] = (int16_t)constrain((long)fftReal[written + i], -32768L, 32767L);
+      normBuf[i] = (int16_t)constrain((long)normF[written + i], -32768L, 32767L);
     fw.write((const uint8_t*)normBuf, chunk * 2);
     written += chunk;
   }
@@ -360,57 +363,82 @@ static void normalizeWavFile()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// FFT 피크 주파수 분석
+// 오프라인 FFT 피크 주파수 분석 (esp-dsp, 녹음 종료 후 1회 실행)
 // ─────────────────────────────────────────────────────────────────────────
 static void analyzeFFT()
 {
   if (!fftReal || !fftImag) { Serial.println("[FFT] Buffer not ready, skipping."); return; }
   if (!rawBuf || rawBufPos == 0) { Serial.println("[FFT] Raw buffer empty, skipping."); return; }
 
-  // 원 데이터(필터 미적용)를 직접 fftReal로 복사 — SD 파일 재읽기 불필요
   uint32_t captureSize = min(rawBufPos, (uint32_t)CODEC_FFT_CAPTURE_SIZE);
-  // float mean = 0.0f;  // DC 제거용 — 코덱 내장 HPF(R14) 활성 시 불필요, 필요 시 주석 해제
+  float    winScale    = 1.0f / (float)(captureSize - 1);
+
+  // Hamming 윈도우 적용 + 허수부 0 초기화 + 제로패딩
   for (uint32_t i = 0; i < captureSize; i++)
   {
-    fftReal[i] = (float)rawBuf[i];
-    // mean += fftReal[i];
+    float win   = 0.54f - 0.46f * cosf(TWO_PI * (float)i * winScale);
+    fftReal[i]  = win * (float)rawBuf[i];
+    fftImag[i]  = 0.0f;
   }
-  // mean /= (float)captureSize;
+  memset(&fftReal[captureSize], 0, (CODEC_FFT_SIZE - captureSize) * sizeof(float));
+  memset(&fftImag[captureSize], 0, (CODEC_FFT_SIZE - captureSize) * sizeof(float));
 
-  // Hamming 윈도우 (DC 제거 비활성 — 코덱 HPF가 대신 처리)
-  for (uint32_t i = 0; i < captureSize; i++)
-  {
-    // fftReal[i] -= mean;  // DC 제거 — 코덱 내장 HPF 미사용 시 주석 해제
-    fftReal[i] *= 0.54f - 0.46f * cosf(TWO_PI * i / (float)(captureSize - 1));
-  }
-
-  // 제로패딩
-  memset(&fftReal[captureSize], 0,
-    (CODEC_FFT_SIZE - captureSize) * sizeof(float));
-  memset(fftImag, 0, CODEC_FFT_SIZE * sizeof(float));
-
+  // arduinoFFT (크기 제한 없음, 안정적)
   ArduinoFFT<float> FFT(fftReal, fftImag, CODEC_FFT_SIZE, (float)NAU88_SAMPLE_RATE);
   FFT.compute(FFTDirection::Forward);
-  FFT.complexToMagnitude();
+  FFT.complexToMagnitude();  // fftReal[i] = magnitude[i]
 
-  // 전기 노이즈 대역(59~61 Hz) 제거 — peak 탐색에서 제외
+  // 피크 탐색: DC 제외, 60 Hz + 고조파 노치 (1~17th), 상위 5개 피크 추출
+  const uint32_t binNyq   = CODEC_FFT_SIZE / 2;
+  const float    binHz    = (float)NAU88_SAMPLE_RATE / (float)CODEC_FFT_SIZE;
+
+  // 60 Hz 기본파 + 고조파 노치 범위 사전 계산 (±1 Hz 폭)
+  // → 60, 120, 180, ... 1020, 1080 Hz (Nyquist 4000 Hz 이내 최대 66th)
+  const float  notchBase  = 60.0f;
+  const float  notchWidth = 1.5f;  // ±1.5 Hz
+
+  // 상위 5개 피크 (빈 인덱스 + 크기)
+  const int    TOP_N = 5;
+  float    topMag[TOP_N] = {};
+  uint32_t topBin[TOP_N] = {};
+
+  for (uint32_t b = 1; b < binNyq; b++)
   {
-    uint32_t binLow  = (uint32_t)(59.0f * CODEC_FFT_SIZE / NAU88_SAMPLE_RATE);
-    uint32_t binHigh = (uint32_t)(61.0f * CODEC_FFT_SIZE / NAU88_SAMPLE_RATE) + 1;
-    for (uint32_t b = binLow; b <= binHigh; b++) fftReal[b] = 0.0f;
-  }
+    // 60 Hz 고조파 노치: 해당 빈의 주파수가 60 Hz 배수 ±1.5 Hz 이내면 제외
+    float freq = b * binHz;
+    float rem  = fmodf(freq, notchBase);
+    if (rem < notchWidth || rem > (notchBase - notchWidth)) continue;
 
-  float peakFreq = FFT.majorPeak();
+    float mag = fftReal[b];
+    // 최솟값 슬롯에 삽입
+    int minIdx = 0;
+    for (int k = 1; k < TOP_N; k++)
+      if (topMag[k] < topMag[minIdx]) minIdx = k;
+    if (mag > topMag[minIdx]) { topMag[minIdx] = mag; topBin[minIdx] = b; }
+  }
+  // 내림차순 정렬 (버블)
+  for (int a = 0; a < TOP_N - 1; a++)
+    for (int b2 = a + 1; b2 < TOP_N; b2++)
+      if (topMag[b2] > topMag[a]) {
+        float  tm = topMag[a]; topMag[a] = topMag[b2]; topMag[b2] = tm;
+        uint32_t tb = topBin[a]; topBin[a] = topBin[b2]; topBin[b2] = tb;
+      }
 
   Serial.println("─────────────────────────────────");
-  Serial.printf("[FFT] Source   : RAW (codec PCM, no SW filter)\n");
-  Serial.printf("[FFT] Signal   : %u samples (%.3f sec)\n",
+  Serial.printf("[FFT] Source     : RAW PCM (no SW filter)\n");
+  Serial.printf("[FFT] Signal     : %u samples (%.3f sec)\n",
     captureSize, (float)captureSize / NAU88_SAMPLE_RATE);
-  Serial.printf("[FFT] Zero-pad : %u → %u\n", captureSize, CODEC_FFT_SIZE);
-  Serial.printf("[FFT] Freq Resolution : %.3f Hz/bin\n",
-    (float)NAU88_SAMPLE_RATE / (float)CODEC_FFT_SIZE);
-  // Serial.printf("[FFT] DC Offset removed : %.1f\n", mean);  // 코덱 HPF 활성 시 불필요
-  Serial.printf("[FFT] Peak Freq : %.2f Hz\n", peakFreq);
+  Serial.printf("[FFT] Zero-pad   : %u → %u  Resolution: %.3f Hz/bin\n",
+    captureSize, CODEC_FFT_SIZE, binHz);
+  Serial.printf("[FFT] 60Hz notch : %.0f Hz 기본파 + 고조파 (±%.1f Hz)\n",
+    notchBase, notchWidth);
+  Serial.println("[FFT] Top peaks:");
+  for (int k = 0; k < TOP_N; k++)
+  {
+    if (topMag[k] == 0.0f) continue;
+    Serial.printf("  #%d  %7.2f Hz  Magnitude: %.1f\n",
+      k + 1, topBin[k] * binHz, topMag[k]);
+  }
   Serial.println("─────────────────────────────────");
 }
 
@@ -474,14 +502,16 @@ static void codecStopRecording(bool sd)
 // ─────────────────────────────────────────────────────────────────────────
 void codecRecorderInit()
 {
-  // FFT 버퍼를 PSRAM에 동적 할당
+  // ── 오프라인 FFT 버퍼 PSRAM 할당 (arduinoFFT) ───────────────────────────
+  //   fftReal + fftImag 각 128 KB = 합계 256 KB PSRAM
   fftReal = (float*)heap_caps_malloc(CODEC_FFT_SIZE * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   fftImag = (float*)heap_caps_malloc(CODEC_FFT_SIZE * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!fftReal || !fftImag)
     Serial.println("[FFT] PSRAM alloc failed!");
   else
-    Serial.printf("[FFT] PSRAM alloc OK: %u KB\n",
-      (uint32_t)(CODEC_FFT_SIZE * sizeof(float) * 2 / 1024));
+    Serial.printf("[FFT] PSRAM alloc OK: %u KB  Resolution=%.3f Hz/bin\n",
+      (uint32_t)(CODEC_FFT_SIZE * sizeof(float) * 2 / 1024),
+      (float)NAU88_SAMPLE_RATE / (float)CODEC_FFT_SIZE);
 
   // 원 데이터 버퍼 PSRAM 할당 (필터 적용 전 I2S 원본)
   rawBuf = (int16_t*)heap_caps_malloc(CODEC_FFT_CAPTURE_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -491,11 +521,16 @@ void codecRecorderInit()
     Serial.printf("[RAW] PSRAM alloc OK: %u KB\n",
       (uint32_t)(CODEC_FFT_CAPTURE_SIZE * sizeof(int16_t) / 1024));
 
+  // I2S 드라이버를 먼저 설치 — 코덱 미연결 상태에서도 크래시 없이 동작
+  if (!codecI2SInit()) { Serial.println("[CODEC] I2S init failed!"); return; }
+
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(I2C_CLOCK_FREQ);
 
-  if (!nau88Init())  { Serial.println("[CODEC] NAU88 init failed!"); return; }
-  if (!codecI2SInit()) { Serial.println("[CODEC] I2S init failed!");  return; }
+  // 코덱 초기화 실패는 치명적이지 않음 — 미연결 시 I2S는 0/노이즈 수신
+  if (!nau88Init()) {
+    Serial.println("[CODEC] NAU88 not found - I2S will receive zeros/noise");
+  }
 
   pinMode(NAU88_TRIGGER_PIN, INPUT_PULLUP);
   Serial.printf("[CODEC] Ready  Trigger=GPIO%d\n", NAU88_TRIGGER_PIN);
@@ -537,31 +572,15 @@ void codecLoop(bool sd, unsigned long now)
     {
       int16_t s = rxBuf[i];
 
-      // ── 원 데이터 저장 (필터 적용 전, FFT 전용) ───────────────────────────
+      // ── 원 데이터 저장 (필터 없는 원본 → FFT + WAV 공통 사용) ─────────────
       if (rawBuf && rawBufPos < (uint32_t)CODEC_FFT_CAPTURE_SIZE)
         rawBuf[rawBufPos++] = s;
 
-      // ── IIR High-Pass (DC/저주파 제거, fc ≈ 10 Hz @ 44.1kHz) ──
-      static float hpPrev = 0.0f;
-      static float hpOut  = 0.0f;
-      const float  hpA    = 0.9986f;  // 1 - 2π×10/44100
-      hpOut  = hpA * (hpOut + (float)s - hpPrev);
-      hpPrev = (float)s;
-      s = (int16_t)hpOut;
-
-      // ── IIR Low-Pass (고주파 노이즈 제거, fc ≈ 5000 Hz @ 44.1kHz) ──
-      static float lpState = 0.0f;
-      const float  lpA     = 0.5412f;  // 1 - 2π×5000/44100 (근사)
-      lpState = lpState * lpA + (float)s * (1.0f - lpA);
-      s = (int16_t)lpState;
-
-      // ── 소프트웨어 IIR 저역통과 필터 (fc ≈ 2000 Hz @ 44100 Hz) ──
-      // alpha = 2π×fc / (2π×fc + fs) = 2π×2000 / (2π×2000 + 44100) ≈ 0.222
-      static float sflpState = 0.0f;
-      const float  lpAlpha = 0.222f;
-      // LPF 적용
-      sflpState = sflpState + lpAlpha * ((float)s - sflpState);
-      s = (int16_t)sflpState;
+      // ※ 소프트웨어 필터 제거됨:
+      //   기존 HPF/LPF 계수가 44.1kHz 기준으로 계산돼 있었으나 실제 fs=8kHz.
+      //   LP1(lpA=0.5412) → 실제 fc≈584Hz, LP2(lpAlpha=0.222) → 실제 fc≈282Hz.
+      //   두 LPF가 직렬로 합쳐져 200Hz 이상 신호 거의 소멸 → WAV 음질 및 FFT 왜곡.
+      //   코덱(NAU88) 하드웨어 ADC 필터링으로 충분하므로 SW 필터 제거.
 
       // 통계
       if (s != 0) codecNonZero++;
