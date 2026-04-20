@@ -4,9 +4,27 @@
 
 #include <Arduino.h>
 #include <SD_MMC.h>
+#include <stdarg.h>
 #include "esp_timer.h"
 #include "led_indicator.h"
+#include "sd_logger.h"
 #include <arduinoFFT.h>
+
+// Serial 출력과 SD 로그 파일에 동시 기록
+static void wavLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void wavLog(const char* fmt, ...)
+{
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);
+  // sdDebugLine은 줄바꿈을 자체 추가하므로 trailing \n 제거
+  int n = (int)strlen(buf);
+  while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+  sdDebugLine(buf);
+}
 
 // ── FFT Analysis ──────────────────────────────────────────────────────────
 // WAV_SAMPLE_RATE=8000, 3sec → 24000 samples
@@ -116,11 +134,11 @@ static void writeWavHeader(File &f, uint32_t dataSize);
 // ── 정규화: WAV 파일 2-pass 처리 (Peak → Gain → 재기록) ──────────────────
 static void normalizeWavFile()
 {
-  if (!fftReal) { Serial.println("[NORM] Buffer not ready"); return; }
+  if (!fftReal) { wavLog("[NORM] Buffer not ready\n"); return; }
 
   // Pass 1: 피크 탐색
   File f = SD_MMC.open(wavFileName, FILE_READ);
-  if (!f) { Serial.printf("[NORM] Open failed: %s\n", wavFileName); return; }
+  if (!f) { wavLog("[NORM] Open failed: %s\n", wavFileName); return; }
   f.seek(44);
 
   uint32_t count  = 0;
@@ -136,14 +154,14 @@ static void normalizeWavFile()
 
   if (peak < 64)
   {
-    Serial.println("[NORM] Signal too weak, skip normalization");
+    wavLog("[NORM] Signal too weak, skip normalization\n");
     return;
   }
 
   // 목표: -1 dBFS (= 32767 × 10^(-1/20) ≈ 29204)
   const float TARGET = 29204.0f;
   float gain = TARGET / (float)peak;
-  Serial.printf("[NORM] Peak: %d  Gain: %.3f (%+.1f dB)\n",
+  wavLog("[NORM] Peak: %d  Gain: %.3f (%+.1f dB)\n",
     peak, gain, 20.0f * log10f(gain));
 
   // Pass 2: 게인 적용 → 파일 재기록
@@ -151,7 +169,7 @@ static void normalizeWavFile()
     fftReal[i] *= gain;
 
   File fw = SD_MMC.open(wavFileName, FILE_WRITE);
-  if (!fw) { Serial.println("[NORM] Rewrite open failed"); return; }
+  if (!fw) { wavLog("[NORM] Rewrite open failed\n"); return; }
 
   writeWavHeader(fw, count * 2);
 
@@ -167,7 +185,7 @@ static void normalizeWavFile()
   }
   fw.flush();
   fw.close();
-  Serial.printf("[NORM] Done: %u samples normalized\n", count);
+  wavLog("[NORM] Done: %u samples normalized\n", count);
 }
 
 // ── FFT Peak Frequency Analysis ───────────────────────────────────────────
@@ -177,7 +195,7 @@ static void analyzeFFT()
 {
   if (!fftReal || !fftImag)
   {
-    Serial.println("[FFT] Buffer not ready, skipping.");
+    wavLog("[FFT] Buffer not ready, skipping.\n");
     return;
   }
 
@@ -185,7 +203,7 @@ static void analyzeFFT()
   File f = SD_MMC.open(wavFileName, FILE_READ);
   if (!f)
   {
-    Serial.printf("[FFT] Cannot open %s\n", wavFileName);
+    wavLog("[FFT] Cannot open %s\n", wavFileName);
     return;
   }
   f.seek(44);
@@ -229,15 +247,15 @@ static void analyzeFFT()
   // majorPeak(): 내장 이차보간으로 bin 경계 사이 정확한 주파수 계산
   float peakFreq = FFT.majorPeak();
 
-  Serial.println("─────────────────────────────────");
-  Serial.printf("[FFT] Signal   : %u samples (%.3f sec)\n",
+  wavLog("─────────────────────────────────\n");
+  wavLog("[FFT] Signal   : %u samples (%.3f sec)\n",
     FFT_CAPTURE_SIZE, (float)FFT_CAPTURE_SIZE / WAV_SAMPLE_RATE);
-  Serial.printf("[FFT] Zero-pad : %u → %u\n", FFT_CAPTURE_SIZE, FFT_SIZE);
-  Serial.printf("[FFT] Freq Resolution : %.3f Hz/bin\n",
+  wavLog("[FFT] Zero-pad : %u → %u\n", FFT_CAPTURE_SIZE, FFT_SIZE);
+  wavLog("[FFT] Freq Resolution : %.3f Hz/bin\n",
     (float)WAV_SAMPLE_RATE / (float)FFT_SIZE);
-  Serial.printf("[FFT] DC Offset removed : %.1f\n", mean);
-  Serial.printf("[FFT] Peak Freq : %.2f Hz\n", peakFreq);
-  Serial.println("─────────────────────────────────");
+  wavLog("[FFT] DC Offset removed : %.1f\n", mean);
+  wavLog("[FFT] Peak Freq : %.2f Hz\n", peakFreq);
+  wavLog("─────────────────────────────────\n");
 }
 
 // ── WAV Header ────────────────────────────────────────────────────────────
@@ -298,14 +316,14 @@ static bool openNewWavFile()
   
   if (!wavFile)
   {
-    Serial.printf("[WAV] Cannot open: %s\n", wavFileName);
+    wavLog("[WAV] Cannot open: %s\n", wavFileName);
     return false;
   }
 
   wavDataBytes = 0;
   writeWavHeader(wavFile, 0);   // placeholder; sizes updated on close
   wavFile.flush();
-  Serial.printf("[WAV] File: %s\n", wavFileName);
+  wavLog("[WAV] File: %s\n", wavFileName);
   return true;
 }
 
@@ -327,7 +345,7 @@ static void closeWavFile()
   wavFile.close();
 
   sec = (float)wavDataBytes / (float)(WAV_SAMPLE_RATE * 2);
-  Serial.printf("[WAV] Saved %s  (%.2f sec, %u bytes)\n", wavFileName, sec, wavDataBytes);
+  wavLog("[WAV] Saved %s  (%.2f sec, %u bytes)\n", wavFileName, sec, wavDataBytes);
 }
 
 // ── Start / Stop ──────────────────────────────────────────────────────────
@@ -335,6 +353,7 @@ static void wavStartRecording(bool sd)
 {
   if (!sd) { Serial.println("[WAV] SD not ready"); return; }
   if (!openNewWavFile()) return;
+  sdDebugOpen(wavFileName);  // WAV 파일과 동일한 이름의 .log 파일 열기
 
   wavFillBuf  = 0;
   wavFillPos  = 0;
@@ -351,7 +370,7 @@ static void wavStartRecording(bool sd)
 
   // 타이머 주기를 WAV_SAMPLE_RATE에서 자동 계산 (analogRead 제약: 10kHz 이하 권장)
   esp_timer_start_periodic(wavEspTimer, 1000000UL / WAV_SAMPLE_RATE);
-  Serial.printf("[WAV] Recording %d sec → %s\n", WAV_RECORD_SECONDS, wavFileName);
+  wavLog("[WAV] Recording %d sec → %s\n", WAV_RECORD_SECONDS, wavFileName);
 }
 
 static void wavStopRecording(bool sd)
@@ -387,9 +406,10 @@ static void wavStopRecording(bool sd)
   closeWavFile();
   normalizeWavFile();         // 정규화: 피크 탐색 → 게인 적용 → 재기록
   analyzeFFT();               // 정규화된 파일로 FFT 주파수 분석
+  wavLog("[WAV] Standby. Press BOOT button to record.\n");
+  sdDebugClose();             // 로그 파일 닫기
   wavState = WAV_STANDBY;
   ledSetState(LED_BOOTING);   // white = standby
-  Serial.println("[WAV] Standby. Press BOOT button to record.");
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -455,7 +475,7 @@ void wavLoop(bool sd, unsigned long now)
     {
       lastPrint = now;
       float elapsed = (float)wavISRCount / (float)WAV_SAMPLE_RATE;
-      Serial.printf("  %.1f / %d sec  (%.1f sec left)\n",
+      wavLog("  %.1f / %d sec  (%.1f sec left)\n",
         elapsed, WAV_RECORD_SECONDS,
         max(0.0f, (float)WAV_RECORD_SECONDS - elapsed));
     }

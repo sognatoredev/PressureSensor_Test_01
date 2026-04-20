@@ -1,5 +1,7 @@
 #include "sd_logger.h"
+#include "time_manager.h"
 #include <SD_MMC.h>
+#include <stdarg.h>
 
 bool sdReady = false;
 
@@ -7,6 +9,9 @@ static File     logFile;
 static char     logFileName[32];
 static uint32_t rowCount  = 0;
 static uint32_t flushCnt  = 0;
+
+// ── Debug log ─────────────────────────────────────────────────────────────
+static File dbgFile;
 
 static uint32_t findNextFileIndex()
 {
@@ -91,3 +96,40 @@ void sdWriteI2C(unsigned long ts, const char *dt,
   afterWrite();
 }
 #endif
+
+// ── Debug log implementation ──────────────────────────────────────────────
+bool sdDebugOpen(const char* wavPath)
+{
+  if (dbgFile) dbgFile.close();
+
+  char logPath[32];
+  strncpy(logPath, wavPath, sizeof(logPath) - 1);
+  logPath[sizeof(logPath) - 1] = '\0';
+  char* ext = strrchr(logPath, '.');
+  if (ext) strncpy(ext, ".log", 5);
+  else     strncat(logPath, ".log", sizeof(logPath) - strlen(logPath) - 1);
+
+  dbgFile = SD_MMC.open(logPath, FILE_WRITE);
+  if (!dbgFile) { Serial.printf("[DBG] Cannot open: %s\n", logPath); return false; }
+  Serial.printf("[DBG] Log: %s\n", logPath);
+  return true;
+}
+
+void sdDebugLine(const char* msg)
+{
+  if (!dbgFile) return;
+
+  char ts[32];
+  getTimeString(ts, sizeof(ts));
+  // NTP 동기화 시 "2024-05-15 09:19:55.123" (len 23) → 인덱스 11부터 "HH:MM:SS.mmm"
+  // millis 기반 시 "00:09:19.123" (len 12) → 그대로 사용
+  const char* hms = (strlen(ts) >= 23) ? (ts + 11) : ts;
+
+  dbgFile.printf("%s -> %s\n", hms, msg);
+  dbgFile.flush();
+}
+
+void sdDebugClose()
+{
+  if (dbgFile) { dbgFile.flush(); dbgFile.close(); }
+}
