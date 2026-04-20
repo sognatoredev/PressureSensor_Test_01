@@ -8,7 +8,7 @@
 //   1 = ADC analog pressure sensor
 //   2 = Piezo vibration WAV recorder (ADC, button-triggered)
 //   3 = Piezo vibration WAV recorder (NAU88C10YG codec via I2S, button-triggered)
-#define SENSOR_TYPE        3
+#define SENSOR_TYPE        2
 
 #define WIFI_SSID     "KT_GiGA_9748"
 #define WIFI_PASSWORD "9cf0bkd529"
@@ -35,9 +35,11 @@
 // ==================== Piezo WAV Recorder (SENSOR_TYPE 2) ====================
 #define WAV_ADC_PIN         1  // GPIO1 = ADC1 CH0 (MAX4466 output)
 #define WAV_TRIGGER_PIN     0  // GPIO0 = BOOT button (active LOW)
-#define WAV_SAMPLE_RATE     44100
+// analogRead() on ESP32-S3 takes ~30-100 µs → safe upper limit ≈ 10 kHz
+// 8000 Hz → timer period = 125 µs, well within analogRead margin
+#define WAV_SAMPLE_RATE     8000
 #define WAV_RECORD_SECONDS  3
-#define WAV_BUF_SAMPLES     4096
+#define WAV_BUF_SAMPLES     1024
 
 // ==================== NAU88C10YG Codec WAV Recorder (SENSOR_TYPE 3) ====================
 // I2C control interface (shares Wire with SENSOR_TYPE 0)

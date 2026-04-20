@@ -9,8 +9,10 @@
 #include <arduinoFFT.h>
 
 // ── FFT Analysis ──────────────────────────────────────────────────────────
-#define FFT_SIZE          262144  // 2^18 ≥ 44100×3=132300 samples (zero-padding)
-#define FFT_CAPTURE_SIZE  (WAV_RECORD_SECONDS * WAV_SAMPLE_RATE)  // 132300 samples @ 44.1kHz
+// WAV_SAMPLE_RATE=8000, 3sec → 24000 samples
+// FFT_SIZE=32768 (2^15): 제로패딩 32768/24000=1.37x, 주파수 해상도 = 8000/32768 ≈ 0.244 Hz/bin
+#define FFT_SIZE          32768   // 2^15 (PSRAM: 32768×4×2=256 KB)
+#define FFT_CAPTURE_SIZE  (WAV_RECORD_SECONDS * WAV_SAMPLE_RATE)  // 24000 samples @ 8kHz
 
 static float* fftReal = nullptr;
 static float* fftImag = nullptr;
@@ -347,7 +349,8 @@ static void wavStartRecording(bool sd)
   wavState    = WAV_RECORDING;
   ledSetState(LED_LOGGING);
 
-  esp_timer_start_periodic(wavEspTimer, 22);    // ~45.5kHz (1000000/22≈45454 Hz, ADC 타이머 한계)
+  // 타이머 주기를 WAV_SAMPLE_RATE에서 자동 계산 (analogRead 제약: 10kHz 이하 권장)
+  esp_timer_start_periodic(wavEspTimer, 1000000UL / WAV_SAMPLE_RATE);
   Serial.printf("[WAV] Recording %d sec → %s\n", WAV_RECORD_SECONDS, wavFileName);
 }
 
