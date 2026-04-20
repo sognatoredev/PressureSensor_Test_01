@@ -10,8 +10,10 @@
 //   3 = Piezo vibration WAV recorder (NAU88C10YG codec via I2S, button-triggered)
 #define SENSOR_TYPE        2
 
-#define WIFI_SSID     "KT_GiGA_9748"
-#define WIFI_PASSWORD "9cf0bkd529"
+// #define WIFI_SSID     "KT_GiGA_9748"
+// #define WIFI_PASSWORD "9cf0bkd529"
+#define WIFI_SSID     "AndroidHotspot4216"
+#define WIFI_PASSWORD "sognatore"
 
 // Sampling interval (ms) — SENSOR_TYPE 0/1 only
 #define SAMPLE_INTERVAL_MS   10
@@ -31,6 +33,11 @@
 
 // ==================== ADC Pressure Sensor (SENSOR_TYPE 1) ====================
 #define ADC_PRESSURE_PIN   4   // GPIO4 (ADC1 CH3)
+
+// ==================== WAV Normalization (SENSOR_TYPE 2/3) ====================
+// 1 = 녹음 후 피크 기준으로 게인 정규화 (재생 음량 일정화, FFT 결과에는 무영향)
+// 0 = 원본 그대로 저장 (기본값)
+#define WAV_NORMALIZE          0
 
 // ==================== Piezo WAV Recorder (SENSOR_TYPE 2) ====================
 #define WAV_ADC_PIN         1  // GPIO1 = ADC1 CH0 (MAX4466 output)
@@ -86,6 +93,18 @@
 
 // ==================== Moving Average Filter ====================
 #define FILTER_SIZE        10
+
+// ==================== Web Server AP Mode (SENSOR_TYPE 2/3) ====================
+// ESP32가 직접 WiFi AP를 생성 → 사용자가 아래 WiFi에 접속 후 브라우저 오픈
+// 접속 주소 (고정): http://192.168.4.1/
+//
+// AP_PASSWORD 는 최소 8자 이상 (WPA2 규격)
+#define AP_SSID      "Wiplat_test_01"
+#define AP_PASSWORD  ""             // 빈 문자열 = 오픈 AP (비밀번호 없음)
+// WPA2 사용 시 비밀번호 최소 8자 필요
+// #define AP_PASSWORD  "wiplat01"  // 8자 이상 예시
+
+#define MDNS_HOSTNAME   "esp32sensor"
 
 // ==================== RGB LED (WS2812B - GPIO48) ====================
 #define RGB_LED_PIN       48

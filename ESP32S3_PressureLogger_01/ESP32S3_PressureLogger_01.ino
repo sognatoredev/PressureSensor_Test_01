@@ -55,8 +55,10 @@
   #include "sensor_adc.h"
 #elif SENSOR_TYPE == 2
   #include "wav_recorder.h"
+  #include "web_server.h"
 #elif SENSOR_TYPE == 3
   #include "wav_recorder_codec.h"
+  #include "web_server.h"
 #endif
 
 static bool sensorReady = false;
@@ -143,6 +145,11 @@ void setup()
     #endif
   }
 
+  // ── Web Server (SENSOR_TYPE 2/3) ──────────────────────────────────────────
+#if SENSOR_TYPE == 2 || SENSOR_TYPE == 3
+  if (sdReady) webServerBegin();
+#endif
+
   // ── Final LED ─────────────────────────────────────────────────────────────
   if      (!sdReady)     ledSetState(LED_SD_ERROR);
   else if (!sensorReady) ledSetState(LED_SENSOR_ERROR);
@@ -184,6 +191,10 @@ void loop()
 #if USE_LTE && LTE_PASSTHROUGH
   ltePassthroughLoop();
   return;
+#endif
+
+#if SENSOR_TYPE == 2 || SENSOR_TYPE == 3
+  webServerLoop();
 #endif
 
   unsigned long now = millis();

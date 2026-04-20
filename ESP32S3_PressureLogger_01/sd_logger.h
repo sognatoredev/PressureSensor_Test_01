@@ -7,6 +7,9 @@ extern bool sdReady;
 // SD_MMC 초기화 (핀 설정, begin)
 bool sdInit();
 
+// SD 카드 재마운트 (언마운트 후 재삽입 시 드라이버 재초기화)
+bool sdRemount();
+
 // 새 CSV 파일 열기 (LOG0001.csv, LOG0002.csv, ...)
 bool openNewLogFile();
 

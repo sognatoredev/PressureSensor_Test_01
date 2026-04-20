@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "led_indicator.h"
 #include "sd_logger.h"
+#include "web_server.h"
 #include <arduinoFFT.h>
 
 // Serial 출력과 SD 로그 파일에 동시 기록
@@ -355,6 +356,9 @@ static void wavStartRecording(bool sd)
   if (!openNewWavFile()) return;
   sdDebugOpen(wavFileName);  // WAV 파일과 동일한 이름의 .log 파일 열기
 
+  // ADC 간섭 방지: 녹음 전 WiFi OFF
+  webServerStop();
+
   wavFillBuf  = 0;
   wavFillPos  = 0;
   wavFlushReq = false;
@@ -404,12 +408,15 @@ static void wavStopRecording(bool sd)
   }
 
   closeWavFile();
-  normalizeWavFile();         // 정규화: 피크 탐색 → 게인 적용 → 재기록
-  analyzeFFT();               // 정규화된 파일로 FFT 주파수 분석
+  analyzeFFT();               // 원본 파일로 FFT 주파수 분석
+#if WAV_NORMALIZE
+  normalizeWavFile();         // 재생 음량 정규화 (선택, config.h에서 제어)
+#endif
   wavLog("[WAV] Standby. Press BOOT button to record.\n");
   sdDebugClose();             // 로그 파일 닫기
   wavState = WAV_STANDBY;
   ledSetState(LED_BOOTING);   // white = standby
+  webServerBegin();           // 녹음 완료 후 WiFi ON + 웹서버 재시작
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -445,6 +452,22 @@ void wavRecorderInit()
 
 void wavLoop(bool sd, unsigned long now)
 {
+  // SD 카드 재삽입 감지: 대기 상태에서 SD 오류 시 3초마다 재마운트 시도
+  if (wavState == WAV_STANDBY && !sdReady)
+  {
+    static unsigned long lastRemount = 0;
+    if (now - lastRemount >= 3000)
+    {
+      lastRemount = now;
+      Serial.println("[SD] Not ready — attempting remount...");
+      if (sdRemount())
+      {
+        sdReady = true;
+        ledSetState(LED_IDLE);
+      }
+    }
+  }
+
   // Button detection (GPIO0 active LOW, 50 ms debounce)
   static bool          lastBtn     = HIGH;
   static unsigned long lastBtnTime = 0;

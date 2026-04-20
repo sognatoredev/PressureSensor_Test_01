@@ -57,6 +57,21 @@ bool sdInit()
   return true;
 }
 
+bool sdRemount()
+{
+  // 열려 있는 파일 닫기
+  if (logFile) { logFile.flush(); logFile.close(); }
+  if (dbgFile) { dbgFile.flush(); dbgFile.close(); }
+
+  // SDMMC 드라이버 완전 해제 후 재초기화
+  SD_MMC.end();
+  delay(300);
+
+  bool ok = sdInit();
+  Serial.printf("[SD] Remount %s\n", ok ? "OK" : "FAILED");
+  return ok;
+}
+
 // ── 파일 교체가 필요한 경우 체크 및 처리 ──────────────────────────────────
 static bool rotateIfNeeded()
 {
