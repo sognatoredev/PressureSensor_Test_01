@@ -12,4 +12,7 @@ void webServerStop();
 // 메인 루프에서 호출 (클라이언트 요청 처리)
 void webServerLoop();
 
+// HTML 녹음 버튼이 눌렸는지 확인 (플래그 소비 — 한 번만 true 반환)
+bool webRecordConsumed();
+
 #endif

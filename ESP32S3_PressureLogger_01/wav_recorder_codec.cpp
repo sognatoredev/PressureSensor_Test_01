@@ -23,6 +23,7 @@
 #include <SD_MMC.h>
 #include <driver/i2s.h>
 #include "led_indicator.h"
+#include "web_server.h"
 #include <arduinoFFT.h>
 
 // ── 상태 머신 ──────────────────────────────────────────────────────────────
@@ -550,6 +551,10 @@ void codecLoop(bool sd, unsigned long now)
     if (btn == LOW && codecState == CODEC_STANDBY)
       codecStartRecording(sd);
   }
+
+  // 웹 버튼 트리거 (버튼0과 동일한 동작)
+  if (codecState == CODEC_STANDBY && webRecordConsumed())
+    codecStartRecording(sd);
 
   // ── I2S 읽기 및 버퍼 채우기 ──────────────────────────────────────────────
   if (codecState == CODEC_RECORDING)

@@ -11,6 +11,7 @@
 
 static WebServer server(80);
 static bool      serverRunning = false;
+static volatile bool g_recordReq = false;
 
 // ── HTML 페이지 (모바일 최적화) ───────────────────────────────────────────
 static const char HTML_HEAD[] PROGMEM =
@@ -30,6 +31,9 @@ static const char HTML_HEAD[] PROGMEM =
   "background:#0d0d1a;border-radius:6px;padding:4px 8px;border:1px solid #333}"
   ".refresh{display:block;text-align:center;color:#7eb8f7;font-size:0.85em;margin-bottom:16px;"
   "text-decoration:none;border:1px solid #7eb8f7;border-radius:8px;padding:8px}"
+  ".rec-btn{display:block;text-align:center;background:#c0392b;color:#fff;font-size:1em;font-weight:bold;"
+  "border:none;border-radius:10px;padding:14px;margin-bottom:14px;width:100%;cursor:pointer;letter-spacing:1px}"
+  ".rec-btn:active{background:#922b21}"
   "</style></head><body>"
   "<h1>&#127932; Vibration WAV Files</h1>";
 
@@ -75,6 +79,7 @@ static void handleRoot()
   int count = min(total, 5);  // 최신 5개만 표시
 
   String html = FPSTR(HTML_HEAD);
+  html += "<a class='rec-btn' href='/record'>&#9679; REC</a>";
   html += "<p class='sub'>최근 ";
   html += String(count);
   html += " / 전체 ";
@@ -108,6 +113,15 @@ static void handleRoot()
 
   html += FPSTR(HTML_TAIL);
   server.send(200, "text/html; charset=utf-8", html);
+}
+
+// ── GET /record : 웹 녹음 버튼 ───────────────────────────────────────────
+static void handleRecord()
+{
+  g_recordReq = true;
+  // 응답 전송 후 wavLoop/codecLoop 에서 플래그를 소비하여 녹음 시작
+  server.sendHeader("Location", "/");
+  server.send(303);
 }
 
 // ── GET /VIBxxxx.wav or /VIBxxxx.log : 파일 스트리밍 ─────────────────────
@@ -166,6 +180,7 @@ void webServerBegin()
     Serial.printf("[mDNS] http://%s.local (iOS/Mac)\n", MDNS_HOSTNAME);
 
   server.on("/", handleRoot);
+  server.on("/record", handleRecord);
   server.onNotFound(handleFile);
   server.begin();
   serverRunning = true;
@@ -185,13 +200,21 @@ void webServerStop()
   // esp_wifi_stop(): RF 송수신 중단 (ADC 간섭 방지), 드라이버는 초기화 상태 유지
   WiFi.softAPdisconnect(false);
   esp_wifi_stop();
-  delay(100);
-  Serial.println("[WebServer] Stopped — RF OFF");
+  btStop();        // BLE 컨트롤러 종료
+  delay(500);      // RF 완전 정착 대기
+  Serial.println("[WebServer] Stopped — WiFi/BT RF OFF");
 }
 
 void webServerLoop()
 {
   if (serverRunning) server.handleClient();
+}
+
+bool webRecordConsumed()
+{
+  if (!g_recordReq) return false;
+  g_recordReq = false;
+  return true;
 }
 
 #endif // SENSOR_TYPE == 2 || SENSOR_TYPE == 3

@@ -481,6 +481,10 @@ void wavLoop(bool sd, unsigned long now)
       wavStartRecording(sd);
   }
 
+  // 웹 버튼 트리거 (버튼0과 동일한 동작)
+  if (wavState == WAV_STANDBY && webRecordConsumed())
+    wavStartRecording(sd);
+
   // Flush full buffers to SD while recording
   if (wavState == WAV_RECORDING)
   {
