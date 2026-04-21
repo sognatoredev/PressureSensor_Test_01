@@ -1,7 +1,7 @@
 #pragma once
 
 // ==================== User Settings ====================
-#define USE_NTP            1
+#define USE_NTP            0
 
 // Select sensor type:
 //   0 = I2C digital sensor  (WNK Series)
@@ -75,7 +75,7 @@
 //   이 모드에서는 lteInit() 등 자동 시퀀스를 건너뛰고 패스스루만 동작합니다.
 #define LTE_PASSTHROUGH     0
 // 사용 중인 핀: 0,1,2,14,20,21,38,39,40,46,48 → 17/18 미사용 확인
-#define USE_LTE             1
+#define USE_LTE             0
 #define LTE_TX_PIN          17    // ESP32 TX → SIMCOM7000 RXD
 #define LTE_RX_PIN          18    // ESP32 RX ← SIMCOM7000 TXD
 #define LTE_PWRKEY_PIN      4     // ESP32 GPIO4 → SIMCOM7000 PWRKEY (active LOW pulse)
