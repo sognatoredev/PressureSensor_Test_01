@@ -81,15 +81,15 @@ void setup()
 
   Serial.println("=========================================");
 #if SENSOR_TYPE == 2
-  Serial.println("  Piezo Vibration WAV Recorder (ADC)");
-  Serial.printf ("  %d Hz · 16-bit PCM Mono · %d sec/file\n",
-    WAV_SAMPLE_RATE, WAV_RECORD_SECONDS);
-  Serial.println("  Press BOOT button (GPIO0) to record");
+  Serial.println("  MEMS Mic WAV Recorder (ADC)");
+  Serial.printf ("  %d Hz · 16-bit PCM Mono · variable length (max %d sec)\n",
+    WAV_SAMPLE_RATE, WAV_MAX_RECORD_SEC);
+  Serial.println("  Connect to WiFi AP, then use REC/STOP buttons in browser");
 #elif SENSOR_TYPE == 3
-  Serial.println("  Piezo Vibration WAV Recorder (NAU88C10YG Codec / I2S)");
-  Serial.printf ("  %d Hz · 16-bit PCM Mono · %d sec/file\n",
-    NAU88_SAMPLE_RATE, NAU88_RECORD_SECONDS);
-  Serial.println("  Press BOOT button (GPIO0) to record");
+  Serial.println("  MEMS Mic WAV Recorder (NAU88C10YG Codec / I2S)");
+  Serial.printf ("  %d Hz · 16-bit PCM Mono · variable length (max %d sec)\n",
+    NAU88_SAMPLE_RATE, NAU88_MAX_RECORD_SEC);
+  Serial.println("  Connect to WiFi AP, then use REC/STOP buttons in browser");
 #else
   Serial.println("  WNK/ADC Pressure Sensor Data Logger");
   Serial.printf ("  %d ms (%0.f Hz) · flush every %d samples\n",
@@ -173,7 +173,7 @@ void setup()
 
   Serial.println();
 #if SENSOR_TYPE == 2 || SENSOR_TYPE == 3
-  Serial.println(">>> Standby. Press BOOT button to record.");
+  Serial.println(">>> Standby. Connect to WiFi AP and press REC at http://192.168.4.1/");
 #elif SENSOR_TYPE == 1
   Serial.println("timestamp_ms | datetime                 | ADC_raw   | ADC_raw_avg");
   Serial.println("-------------|--------------------------|-----------|------------");

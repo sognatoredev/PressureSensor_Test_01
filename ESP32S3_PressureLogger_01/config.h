@@ -6,8 +6,8 @@
 // Select sensor type:
 //   0 = I2C digital sensor  (WNK Series)
 //   1 = ADC analog pressure sensor
-//   2 = Piezo vibration WAV recorder (ADC, button-triggered)
-//   3 = Piezo vibration WAV recorder (NAU88C10YG codec via I2S, button-triggered)
+//   2 = MEMS Mic WAV recorder (ADC, WiFi web-triggered)
+//   3 = MEMS Mic WAV recorder (NAU88C10YG codec via I2S, WiFi web-triggered)
 #define SENSOR_TYPE        2
 
 // #define WIFI_SSID     "KT_GiGA_9748"
@@ -39,13 +39,19 @@
 // 0 = 원본 그대로 저장 (기본값)
 #define WAV_NORMALIZE          0
 
-// ==================== Piezo WAV Recorder (SENSOR_TYPE 2) ====================
-#define WAV_ADC_PIN         1  // GPIO1 = ADC1 CH0 (MAX4466 output)
-#define WAV_TRIGGER_PIN     0  // GPIO0 = BOOT button (active LOW)
+// ==================== MEMS Mic WAV Recorder (SENSOR_TYPE 2) ====================
+// 방수 기구물 내장 — 물리 버튼 사용 불가, WiFi 웹 전용 제어
+#define WAV_ADC_PIN         1  // GPIO1 = ADC1 CH0 (MEMS Mic analog output)
+#define WAV_TRIGGER_PIN     0  // GPIO0 = BOOT button (비상 디버그 전용, 정상 미사용)
 // analogRead() on ESP32-S3 takes ~30-100 µs → safe upper limit ≈ 10 kHz
 // 8000 Hz → timer period = 125 µs, well within analogRead margin
 #define WAV_SAMPLE_RATE     8000
-#define WAV_RECORD_SECONDS  3
+
+// 가변 길이 녹음: REC 버튼으로 시작, STOP 버튼으로 종료
+// WAV_RECORD_SECONDS 제거 → 아래 최대 제한값으로 대체
+#define WAV_MAX_RECORD_SEC  3600   // 안전 최대 녹음 시간 (초) — 1시간
+#define WAV_SD_RESERVE_MB   10     // SD 여유 공간 최소값 (MB), 미달 시 자동 종료
+
 #define WAV_BUF_SAMPLES     1024
 
 // ==================== NAU88C10YG Codec WAV Recorder (SENSOR_TYPE 3) ====================
@@ -63,10 +69,14 @@
 #define NAU88_I2S_LRCLK_PIN  1     // LR Clock output    → NAU88 LRC / WS
 #define NAU88_I2S_DIN_PIN    46    // Data input         ← NAU88 ADCOUT  (GPIO46: 입력 전용 strapping)
 
-#define NAU88_TRIGGER_PIN    0     // BOOT button (active LOW) — same as SENSOR_TYPE 2
+#define NAU88_TRIGGER_PIN    0     // BOOT button (비상 디버그 전용, 정상 미사용)
 // #define NAU88_SAMPLE_RATE    44100 // 44.1 kHz (MCLK = 256 × 44100 = 11.2896 MHz, APLL)
-#define NAU88_SAMPLE_RATE    8000 // 44.1 kHz (MCLK = 256 × 44100 = 11.2896 MHz, APLL)
-#define NAU88_RECORD_SECONDS 3     // recording length per file
+#define NAU88_SAMPLE_RATE    8000  // 8 kHz (MCLK = 256 × 8000 = 2.048 MHz)
+
+// 가변 길이 녹음
+#define NAU88_MAX_RECORD_SEC 3600   // 안전 최대 녹음 시간 (초) — 1시간
+#define NAU88_SD_RESERVE_MB  10     // SD 여유 공간 최소값 (MB)
+
 #define NAU88_BUF_SAMPLES    4096  // double-buffer size (samples per half)
 
 // ==================== LTE (SIMCOM7000) ====================
@@ -99,7 +109,7 @@
 // 접속 주소 (고정): http://192.168.4.1/
 //
 // AP_PASSWORD 는 최소 8자 이상 (WPA2 규격)
-#define AP_SSID      "Wiplat_test_01"
+#define AP_SSID      "WP_MEMS_Mic"
 #define AP_PASSWORD  ""             // 빈 문자열 = 오픈 AP (비밀번호 없음)
 // WPA2 사용 시 비밀번호 최소 8자 필요
 // #define AP_PASSWORD  "wiplat01"  // 8자 이상 예시

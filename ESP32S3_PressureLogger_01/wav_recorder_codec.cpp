@@ -50,8 +50,11 @@ static uint32_t codecNonZero    = 0;   // 0이 아닌 샘플 수
 // ── 오프라인 FFT 버퍼 (PSRAM 동적 할당) ──────────────────────────────────
 //   CODEC_FFT_SIZE = 32768 (2^15): 제로패딩 후 FFT 포인트 수
 //   fftReal / fftImag 각 128 KB → 합계 256 KB PSRAM
+//   CODEC_FFT_CAPTURE_SIZE: rawBuf에 저장하는 최대 샘플 수
+//     가변 길이 녹음 대응 — FFT_SIZE와 동일하게 설정 (32768 samples @ 8kHz = 4.096초)
+//     녹음이 4.096초 이상이면 앞 구간만 FFT 분석 (실제 WAV 저장은 전체 길이)
 #define CODEC_FFT_SIZE         32768
-#define CODEC_FFT_CAPTURE_SIZE (NAU88_RECORD_SECONDS * NAU88_SAMPLE_RATE)
+#define CODEC_FFT_CAPTURE_SIZE CODEC_FFT_SIZE   // 최대 FFT_SIZE 샘플 저장 (64 KB PSRAM)
 
 static float*   fftReal = nullptr;  // PSRAM: 실수부 (128 KB)
 static float*   fftImag = nullptr;  // PSRAM: 허수부 (128 KB)
@@ -304,8 +307,8 @@ static void codecStartRecording(bool sd)
 
   codecState = CODEC_RECORDING;
   ledSetState(LED_LOGGING);
-  Serial.printf("[CODEC] REC start → %s  (%d sec)\n",
-    codecFileName, NAU88_RECORD_SECONDS);
+  webSetRecording(true);   // 웹 UI → STOP 버튼으로 전환
+  Serial.printf("[CODEC] REC start → %s\n", codecFileName);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -431,7 +434,7 @@ static void analyzeFFT()
     captureSize, (float)captureSize / NAU88_SAMPLE_RATE);
   Serial.printf("[FFT] Zero-pad   : %u → %u  Resolution: %.3f Hz/bin\n",
     captureSize, CODEC_FFT_SIZE, binHz);
-  Serial.printf("[FFT] 60Hz notch : %.0f Hz 기본파 + 고조파 (±%.1f Hz)\n",
+  Serial.printf("[FFT] 60Hz notch : %.0f Hz fundamental + harmonics (+-%.1f Hz)\n",
     notchBase, notchWidth);
   Serial.println("[FFT] Top peaks:");
   for (int k = 0; k < TOP_N; k++)
@@ -449,26 +452,23 @@ static void analyzeFFT()
 static void codecStopRecording(bool sd)
 {
   codecState = CODEC_SAVING;
+  webSetRecording(false);  // 웹 UI → REC 버튼으로 복귀
 
   if (!sd || !codecFile) { codecState = CODEC_STANDBY; return; }
 
-  const uint32_t maxBytes = (uint32_t)NAU88_RECORD_SECONDS * NAU88_SAMPLE_RATE * 2;
-
-  // 완료된 더블 버퍼 플러시
+  // 완료된 더블 버퍼 플러시 (가변 길이: maxBytes 상한 제거)
   if (codecFlushReq)
   {
-    uint32_t need  = maxBytes - min(codecDataBytes, maxBytes);
-    uint32_t bytes = min((uint32_t)(NAU88_BUF_SAMPLES * 2), need);
-    if (bytes) { codecFile.write((const uint8_t*)codecBuf[codecFlushBuf], bytes); codecDataBytes += bytes; }
+    codecFile.write((const uint8_t*)codecBuf[codecFlushBuf], NAU88_BUF_SAMPLES * 2);
+    codecDataBytes += (uint32_t)(NAU88_BUF_SAMPLES * 2);
     codecFlushReq = false;
   }
 
   // 부분 채워진 버퍼 플러시
+  if (codecFillPos > 0)
   {
-    uint32_t need  = maxBytes - min(codecDataBytes, maxBytes);
-    uint32_t avail = codecFillPos * 2;
-    uint32_t bytes = min(avail, need);
-    if (bytes) { codecFile.write((const uint8_t*)codecBuf[codecFillBuf], bytes); codecDataBytes += bytes; }
+    codecFile.write((const uint8_t*)codecBuf[codecFillBuf], codecFillPos * 2);
+    codecDataBytes += (uint32_t)(codecFillPos * 2);
   }
 
   // WAV 헤더 크기 업데이트
@@ -491,11 +491,11 @@ static void codecStopRecording(bool sd)
   Serial.println("─────────────────────────────────");
 
   normalizeWavFile();   // 피크 탐색 → 게인 적용 → 재기록
-  analyzeFFT();         // 정규화된 파일로 FFT 주파수 분석
+  analyzeFFT();         // FFT 주파수 분석
 
   codecState = CODEC_STANDBY;
   ledSetState(LED_BOOTING);
-  Serial.println("[CODEC] Standby. Press BOOT to record.");
+  Serial.println("[CODEC] Standby. Press REC in browser to start recording.");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -539,22 +539,27 @@ void codecRecorderInit()
 
 void codecLoop(bool sd, unsigned long now)
 {
-  // ── 버튼 감지 (BOOT, 50 ms 디바운스) ────────────────────────────────────
+  // ── 웹 REC 버튼 ──────────────────────────────────────────────────────────
+  if (codecState == CODEC_STANDBY && webRecordConsumed())
+    codecStartRecording(sd);
+
+  // ── 웹 STOP 버튼 ─────────────────────────────────────────────────────────
+  if (codecState == CODEC_RECORDING && webStopConsumed())
+    codecStopRecording(sd);
+
+  // ── 비상 물리 버튼 (방수 기구물에서는 정상 미사용, 디버그 전용) ──────────
+#if 0
   static bool          lastBtn     = HIGH;
   static unsigned long lastBtnTime = 0;
   bool btn = (bool)digitalRead(NAU88_TRIGGER_PIN);
-
   if (btn != lastBtn && (now - lastBtnTime) > 50)
   {
     lastBtnTime = now;
     lastBtn     = btn;
-    if (btn == LOW && codecState == CODEC_STANDBY)
-      codecStartRecording(sd);
+    if (btn == LOW && codecState == CODEC_STANDBY)   codecStartRecording(sd);
+    if (btn == LOW && codecState == CODEC_RECORDING) codecStopRecording(sd);
   }
-
-  // 웹 버튼 트리거 (버튼0과 동일한 동작)
-  if (codecState == CODEC_STANDBY && webRecordConsumed())
-    codecStartRecording(sd);
+#endif
 
   // ── I2S 읽기 및 버퍼 채우기 ──────────────────────────────────────────────
   if (codecState == CODEC_RECORDING)
@@ -565,7 +570,7 @@ void codecLoop(bool sd, unsigned long now)
 
     uint32_t n = bytesRead / sizeof(int16_t);
 
-    // ── 초반 원시값 덤프 (처음 3샘플만) ─────────────────────────────────
+    // 초반 원시값 덤프 (처음 3샘플만)
     if (codecSampleCount < 8 && n > 0)
     {
       for (uint32_t d = 0; d < min(n, (uint32_t)3); d++)
@@ -577,22 +582,13 @@ void codecLoop(bool sd, unsigned long now)
     {
       int16_t s = rxBuf[i];
 
-      // ── 원 데이터 저장 (필터 없는 원본 → FFT + WAV 공통 사용) ─────────────
       if (rawBuf && rawBufPos < (uint32_t)CODEC_FFT_CAPTURE_SIZE)
         rawBuf[rawBufPos++] = s;
 
-      // ※ 소프트웨어 필터 제거됨:
-      //   기존 HPF/LPF 계수가 44.1kHz 기준으로 계산돼 있었으나 실제 fs=8kHz.
-      //   LP1(lpA=0.5412) → 실제 fc≈584Hz, LP2(lpAlpha=0.222) → 실제 fc≈282Hz.
-      //   두 LPF가 직렬로 합쳐져 200Hz 이상 신호 거의 소멸 → WAV 음질 및 FFT 왜곡.
-      //   코덱(NAU88) 하드웨어 ADC 필터링으로 충분하므로 SW 필터 제거.
-
-      // 통계
       if (s != 0) codecNonZero++;
       if (s < codecPcmMin) codecPcmMin = s;
       if (s > codecPcmMax) codecPcmMax = s;
 
-      // 더블 버퍼 채우기
       codecBuf[codecFillBuf][codecFillPos] = s;
       codecSampleCount++;
 
@@ -613,20 +609,39 @@ void codecLoop(bool sd, unsigned long now)
       codecFlushReq = false;
     }
 
-    // 진행 출력 (500 ms 간격)
+    // 진행 출력 + 웹 경과 시간 갱신 (500 ms 간격)
     static unsigned long lastPrint = 0;
     if (now - lastPrint >= 500)
     {
       lastPrint = now;
-      float elapsed = (float)codecSampleCount / (float)NAU88_SAMPLE_RATE;
-      Serial.printf("  %.1f / %d sec  nonzero=%u  min=%d  max=%d\n",
-        elapsed, NAU88_RECORD_SECONDS,
-        codecNonZero, codecPcmMin, codecPcmMax);
+      float    elapsed    = (float)codecSampleCount / (float)NAU88_SAMPLE_RATE;
+      uint32_t elapsedSec = (uint32_t)elapsed;
+      webSetElapsed(elapsedSec);
+
+      // SD 여유 공간 체크 (5초마다)
+      static unsigned long lastSpaceCheck = 0;
+      if (now - lastSpaceCheck >= 5000)
+      {
+        lastSpaceCheck = now;
+        uint64_t freeMB = (SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL);
+        if (freeMB < (uint64_t)NAU88_SD_RESERVE_MB)
+        {
+          Serial.printf("[CODEC] SD free space low (%llu MB) — auto stop\n", freeMB);
+          codecStopRecording(sd);
+          return;
+        }
+      }
+
+      Serial.printf("  %.1f sec  nonzero=%u  min=%d  max=%d\n",
+        elapsed, codecNonZero, codecPcmMin, codecPcmMax);
     }
 
-    // 목표 샘플 수 달성 → 종료
-    if (codecSampleCount >= (uint32_t)NAU88_RECORD_SECONDS * NAU88_SAMPLE_RATE)
+    // 안전 최대 시간 초과 → 자동 종료
+    if (codecSampleCount >= (uint32_t)NAU88_MAX_RECORD_SEC * NAU88_SAMPLE_RATE)
+    {
+      Serial.printf("[CODEC] Max record time (%d sec) reached — auto stop\n", NAU88_MAX_RECORD_SEC);
       codecStopRecording(sd);
+    }
   }
 }
 

@@ -6,6 +6,7 @@
 #include <SD_MMC.h>
 #include <stdarg.h>
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "led_indicator.h"
 #include "sd_logger.h"
 #include "web_server.h"
@@ -21,27 +22,40 @@ static void wavLog(const char* fmt, ...)
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   Serial.print(buf);
-  // sdDebugLine은 줄바꿈을 자체 추가하므로 trailing \n 제거
   int n = (int)strlen(buf);
   while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
   sdDebugLine(buf);
 }
 
 // ── FFT Analysis ──────────────────────────────────────────────────────────
-// WAV_SAMPLE_RATE=8000, 3sec → 24000 samples
-// FFT_SIZE=32768 (2^15): 제로패딩 32768/24000=1.37x, 주파수 해상도 = 8000/32768 ≈ 0.244 Hz/bin
-#define FFT_SIZE          32768   // 2^15 (PSRAM: 32768×4×2=256 KB)
-#define FFT_CAPTURE_SIZE  (WAV_RECORD_SECONDS * WAV_SAMPLE_RATE)  // 24000 samples @ 8kHz
+// FFT_SIZE = 32768 (2^15): 최대 32768 샘플 분석, 초과분은 앞 구간만 사용
+// 주파수 해상도 = WAV_SAMPLE_RATE / FFT_SIZE = 8000 / 32768 ≈ 0.244 Hz/bin
+#define FFT_SIZE   32768   // 2^15 (PSRAM: 32768×4×2 = 256 KB)
 
 static float* fftReal = nullptr;
 static float* fftImag = nullptr;
 
 // ── Biquad IIR 필터 (Direct Form II Transposed) ────────────────────────────
-// 수치 안정성이 가장 우수한 구조 (누적 오차 최소)
+// fs = 8000 Hz 기준으로 재계산 (MEMS 마이크용)
+//
+// [변경 이력]
+//   이전: 44100Hz 기준 계수 사용 → 실제 fc: HP≈36Hz, LP≈362Hz (설계 의도 대비 5~6배 저하)
+//   현재: 8000Hz 기준으로 재계산
+//     HP  80Hz @ 8000Hz (입바람·저주파 핸들링 노이즈 제거, 음성 대역 유지)
+//     LP 3600Hz @ 8000Hz (나이퀴스트 4000Hz 직전 앨리어싱 방지)
+//
+// HP 80Hz, Q=0.7071 @ fs=8000Hz:
+//   K = tan(π×80/8000) = tan(0.031416) = 0.031462
+//   norm = 1 + K/Q + K² = 1 + 0.044499 + 0.000989 = 1.045488
+//   b0 =  1/norm           =  0.95652
+//   b1 = -2/norm           = -1.91303
+//   b2 =  1/norm           =  0.95652
+//   a1 = 2(K²-1)/norm      = -1.91115  [ 2×(0.000989-1)/1.045488 ]
+//   a2 = (1-K/Q+K²)/norm   =  0.91454  [ (1-0.044499+0.000989)/1.045488 ]
 typedef struct {
-  float b0, b1, b2;  // feedforward 계수
-  float a1, a2;      // feedback 계수
-  float w1, w2;      // 내부 상태 (딜레이 레지스터)
+  float b0, b1, b2;
+  float a1, a2;
+  float w1, w2;
 } Biquad_t;
 
 static inline float biquadProcess(Biquad_t* f, float x)
@@ -52,25 +66,20 @@ static inline float biquadProcess(Biquad_t* f, float x)
   return y;
 }
 
-// ── 대역통과 필터: 200Hz HP + 2000Hz LP (2차 Butterworth @ 44100Hz) ──────────
-// HP 200Hz: K=tan(π*200/44100)=0.014265, Q=0.7071
-// denom = 1 + K/Q + K² = 1.020377
+// HP 80Hz @ 8000Hz, Q=0.7071 (2차 Butterworth 하이패스)
 static Biquad_t hpFilter = {
-   0.98003f, -1.96006f,  0.98003f,   // b0, b1, b2
-  -1.95968f,  0.96045f,              // a1, a2
-   0.0f, 0.0f                        // w1, w2
+   0.95652f, -1.91303f,  0.95652f,   // b0, b1, b2
+  -1.91115f,  0.91454f,              // a1, a2
+   0.0f, 0.0f                        // w1, w2 (상태)
 };
 
-// LP 2000Hz: K=tan(π*2000/44100)=0.14312, Q=0.7071
-// denom = 1 + K/Q + K² = 1.22290
-static Biquad_t lpFilter = {
-   0.01676f,  0.03351f,  0.01676f,   // b0, b1, b2
-  -1.60216f,  0.66895f,              // a1, a2
-   0.0f, 0.0f                        // w1, w2
-};
+// LP 3600Hz @ 8000Hz: 나이퀴스트(4kHz)에 매우 가까우므로 1차 RC 필터 사용
+// α = 1 - exp(-2π × fc / fs) = 1 - exp(-2π×3600/8000) = 1 - exp(-2.827) ≈ 0.9406
+// y[n] = α×x[n] + (1-α)×y[n-1]  →  IIR 1차 LPF
+static float lpAlpha  = 0.9406f;   // LP 3600Hz @ 8000Hz
+static float lpState  = 0.0f;      // 이전 출력값
 
 // ── TPDF 디더링 (삼각형 PDF, LCG 난수) ────────────────────────────────────
-// 두 개의 1-bit 난수 합산 → [-1, 0, +1] 삼각분포 → 양자화 왜곡을 노이즈로 분산
 static uint32_t rngState = 0xDEADBEEFu;
 
 static inline float tpdfDither()
@@ -79,14 +88,14 @@ static inline float tpdfDither()
   int d1 = (int)(rngState >> 31);
   rngState = rngState * 1664525u + 1013904223u;
   int d2 = (int)(rngState >> 31);
-  return (float)(d1 - d2);   // -1, 0, or +1
+  return (float)(d1 - d2);
 }
 
 // ── WAV State Machine ─────────────────────────────────────────────────────
 enum WavState { WAV_STANDBY, WAV_RECORDING, WAV_SAVING };
 static WavState wavState = WAV_STANDBY;
 
-// ── Double buffer (4096 × 2 × 2 = 16 KB in internal SRAM) ────────────────
+// ── Double buffer (WAV_BUF_SAMPLES × 2 × 2 = 4 KB in internal SRAM) ───────
 static int16_t           wavBuf[2][WAV_BUF_SAMPLES];
 static volatile uint8_t  wavFillBuf  = 0;
 static volatile uint16_t wavFillPos  = 0;
@@ -99,6 +108,9 @@ static File     wavFile;
 static char     wavFileName[32];
 static uint32_t wavDataBytes = 0;
 
+// ── 녹음 시작 시각 (경과 시간 계산용) ─────────────────────────────────────
+static unsigned long wavStartMs = 0;
+
 // ── esp_timer handle ───────────────────────────────────────────────────────
 static esp_timer_handle_t wavEspTimer = NULL;
 
@@ -106,12 +118,16 @@ static esp_timer_handle_t wavEspTimer = NULL;
 static void wavTimerCb(void *arg)
 {
   int raw = analogRead(WAV_ADC_PIN);
+  // 12bit ADC 중심값(2048) 기준 부호 있는 값으로 변환, 4비트 좌쉬프트로 16bit 스케일
   float sample = (float)((raw - 2048) << 4);
 
-  // 1. 200Hz 하이패스 — DC 성분 및 저주파 진동 제거
+  // 1. HP 80Hz — DC 및 저주파 입바람/핸들링 노이즈 제거 (MEMS 마이크용)
   sample = biquadProcess(&hpFilter, sample);
-  // 2. 2000Hz 로우패스 — 고주파 화이트노이즈 제거
-  sample = biquadProcess(&lpFilter, sample);
+
+  // 2. LP 3600Hz — 나이퀴스트 근방 앨리어싱 방지 (1차 IIR RC 필터)
+  lpState = lpAlpha * sample + (1.0f - lpAlpha) * lpState;
+  sample  = lpState;
+
   // 3. TPDF 디더링 — int16 재양자화 시 왜곡 분산
   sample += tpdfDither();
 
@@ -129,23 +145,24 @@ static void wavTimerCb(void *arg)
   }
 }
 
-// 전방 선언 (normalizeWavFile이 writeWavHeader보다 앞에 위치하므로)
+// 전방 선언
 static void writeWavHeader(File &f, uint32_t dataSize);
 
-// ── 정규화: WAV 파일 2-pass 처리 (Peak → Gain → 재기록) ──────────────────
-static void normalizeWavFile()
+// ── 정규화: WAV 파일 2-pass (Peak → Gain → 재기록) ───────────────────────
+static void normalizeWavFile(uint32_t sampleCount)
 {
   if (!fftReal) { wavLog("[NORM] Buffer not ready\n"); return; }
 
-  // Pass 1: 피크 탐색
   File f = SD_MMC.open(wavFileName, FILE_READ);
   if (!f) { wavLog("[NORM] Open failed: %s\n", wavFileName); return; }
   f.seek(44);
 
-  uint32_t count  = 0;
-  int16_t  peak   = 0;
+  // Pass 1: 피크 탐색 (최대 FFT_SIZE 샘플, 초과분은 건너뜀)
+  uint32_t readCount = min(sampleCount, (uint32_t)FFT_SIZE);
+  uint32_t count = 0;
+  int16_t  peak  = 0;
   int16_t  s;
-  while (f.read((uint8_t*)&s, 2) == 2 && count < (uint32_t)FFT_CAPTURE_SIZE)
+  while (f.read((uint8_t*)&s, 2) == 2 && count < readCount)
   {
     fftReal[count++] = (float)s;
     int16_t a = (s < 0) ? -s : s;
@@ -159,13 +176,11 @@ static void normalizeWavFile()
     return;
   }
 
-  // 목표: -1 dBFS (= 32767 × 10^(-1/20) ≈ 29204)
-  const float TARGET = 29204.0f;
+  const float TARGET = 29204.0f;  // -1 dBFS
   float gain = TARGET / (float)peak;
   wavLog("[NORM] Peak: %d  Gain: %.3f (%+.1f dB)\n",
     peak, gain, 20.0f * log10f(gain));
 
-  // Pass 2: 게인 적용 → 파일 재기록
   for (uint32_t i = 0; i < count; i++)
     fftReal[i] *= gain;
 
@@ -190,9 +205,8 @@ static void normalizeWavFile()
 }
 
 // ── FFT Peak Frequency Analysis ───────────────────────────────────────────
-// SD 파일에서 직접 읽기 → Core 1에서만 접근 → 코어 간 캐시 문제 없음
-// 윈도우는 실제 신호 구간(FFT_CAPTURE_SIZE)에만 수동 적용 후 제로패딩
-static void analyzeFFT()
+// 가변 길이 녹음 대응: 실제 녹음 샘플 수를 받아 최대 FFT_SIZE까지 분석
+static void analyzeFFT(uint32_t totalSamples)
 {
   if (!fftReal || !fftImag)
   {
@@ -200,7 +214,15 @@ static void analyzeFFT()
     return;
   }
 
-  // WAV 파일 열기 (헤더 44바이트 스킵 후 PCM 샘플 읽기)
+  // 분석 구간: 실제 샘플과 FFT_SIZE 중 작은 쪽 (장시간 녹음 시 앞 구간 분석)
+  uint32_t captureSize = min(totalSamples, (uint32_t)FFT_SIZE);
+  if (captureSize < 64)
+  {
+    wavLog("[FFT] Too few samples (%u), skipping.\n", captureSize);
+    return;
+  }
+
+  // WAV 파일에서 PCM 샘플 읽기 (헤더 44바이트 스킵)
   File f = SD_MMC.open(wavFileName, FILE_READ);
   if (!f)
   {
@@ -209,9 +231,8 @@ static void analyzeFFT()
   }
   f.seek(44);
 
-  // SD → fftReal (int16_t → float), DC 평균 동시 계산
   float mean = 0.0f;
-  for (uint32_t i = 0; i < FFT_CAPTURE_SIZE; i++)
+  for (uint32_t i = 0; i < captureSize; i++)
   {
     int16_t s = 0;
     f.read((uint8_t*)&s, 2);
@@ -219,42 +240,45 @@ static void analyzeFFT()
     mean += fftReal[i];
   }
   f.close();
-  mean /= (float)FFT_CAPTURE_SIZE;
+  mean /= (float)captureSize;
 
-  // DC 제거 + Hamming 윈도우를 실제 신호 구간에만 적용
-  for (uint32_t i = 0; i < FFT_CAPTURE_SIZE; i++)
+  // DC 제거 + Hamming 윈도우 (실제 신호 구간에만 적용)
+  for (uint32_t i = 0; i < captureSize; i++)
   {
     fftReal[i] -= mean;
-    fftReal[i] *= 0.54f - 0.46f * cosf(TWO_PI * i / (float)(FFT_CAPTURE_SIZE - 1));
+    fftReal[i] *= 0.54f - 0.46f * cosf(TWO_PI * i / (float)(captureSize - 1));
   }
 
-  // 제로패딩 (FFT_CAPTURE_SIZE ~ FFT_SIZE-1)
-  memset(&fftReal[FFT_CAPTURE_SIZE], 0,
-    (FFT_SIZE - FFT_CAPTURE_SIZE) * sizeof(float));
+  // 제로패딩 (captureSize < FFT_SIZE 인 경우)
+  if (captureSize < (uint32_t)FFT_SIZE)
+  {
+    memset(&fftReal[captureSize], 0, (FFT_SIZE - captureSize) * sizeof(float));
+  }
   memset(fftImag, 0, FFT_SIZE * sizeof(float));
 
-  // FFT 계산 (windowing은 이미 수동 적용했으므로 호출 안 함)
+  // FFT 계산
   ArduinoFFT<float> FFT(fftReal, fftImag, FFT_SIZE, (float)WAV_SAMPLE_RATE);
   FFT.compute(FFTDirection::Forward);
   FFT.complexToMagnitude();
 
-  // 전기 노이즈 대역(59~61 Hz) 제거 — peak 탐색에서 제외
+  // 전기 노이즈 대역(59~61 Hz) 제거
   {
     uint32_t binLow  = (uint32_t)(59.0f * FFT_SIZE / WAV_SAMPLE_RATE);
     uint32_t binHigh = (uint32_t)(61.0f * FFT_SIZE / WAV_SAMPLE_RATE) + 1;
-    for (uint32_t b = binLow; b <= binHigh; b++) fftReal[b] = 0.0f;
+    for (uint32_t b = binLow; b <= binHigh && b < (uint32_t)(FFT_SIZE/2); b++)
+      fftReal[b] = 0.0f;
   }
 
-  // majorPeak(): 내장 이차보간으로 bin 경계 사이 정확한 주파수 계산
   float peakFreq = FFT.majorPeak();
 
   wavLog("─────────────────────────────────\n");
   wavLog("[FFT] Signal   : %u samples (%.3f sec)\n",
-    FFT_CAPTURE_SIZE, (float)FFT_CAPTURE_SIZE / WAV_SAMPLE_RATE);
-  wavLog("[FFT] Zero-pad : %u → %u\n", FFT_CAPTURE_SIZE, FFT_SIZE);
-  wavLog("[FFT] Freq Resolution : %.3f Hz/bin\n",
-    (float)WAV_SAMPLE_RATE / (float)FFT_SIZE);
-  wavLog("[FFT] DC Offset removed : %.1f\n", mean);
+    captureSize, (float)captureSize / WAV_SAMPLE_RATE);
+  if (captureSize < totalSamples)
+    wavLog("[FFT] (analyzing first %u of %u total samples)\n", captureSize, totalSamples);
+  wavLog("[FFT] Zero-pad : %u → %u\n", captureSize, FFT_SIZE);
+  wavLog("[FFT] Freq Res : %.3f Hz/bin\n", (float)WAV_SAMPLE_RATE / (float)FFT_SIZE);
+  wavLog("[FFT] DC removed: %.1f\n", mean);
   wavLog("[FFT] Peak Freq : %.2f Hz\n", peakFreq);
   wavLog("─────────────────────────────────\n");
 }
@@ -286,35 +310,26 @@ static void writeWavHeader(File &f, uint32_t dataSize)
   f.write((const uint8_t*)&dataSize,   4);
 }
 
-// ── File Open / Close ─────────────────────────────────────────────────────
+// ── File Index ────────────────────────────────────────────────────────────
 static uint32_t findNextWavFileIndex()
 {
   char name[32];
-
   for (uint32_t i = 1; i <= 9999; i++)
   {
     snprintf(name, sizeof(name), "/VIB%04u.wav", i);
-    if (!SD_MMC.exists(name))
-    {
-      return i;
-    }
+    if (!SD_MMC.exists(name)) return i;
   }
   return 9999;
 }
 
 static bool openNewWavFile()
 {
-  uint32_t idx = 0;
+  if (wavFile) wavFile.close();
 
-  if(wavFile)
-  {
-    wavFile.close();
-  }
-
-  idx = findNextWavFileIndex();
+  uint32_t idx = findNextWavFileIndex();
   snprintf(wavFileName, sizeof(wavFileName), "/VIB%04u.wav", idx);
   wavFile = SD_MMC.open(wavFileName, FILE_WRITE);
-  
+
   if (!wavFile)
   {
     wavLog("[WAV] Cannot open: %s\n", wavFileName);
@@ -322,7 +337,7 @@ static bool openNewWavFile()
   }
 
   wavDataBytes = 0;
-  writeWavHeader(wavFile, 0);   // placeholder; sizes updated on close
+  writeWavHeader(wavFile, 0);  // placeholder: 종료 시 업데이트
   wavFile.flush();
   wavLog("[WAV] File: %s\n", wavFileName);
   return true;
@@ -330,22 +345,15 @@ static bool openNewWavFile()
 
 static void closeWavFile()
 {
-  int32_t riffSize = 0;
-  float sec = 0.0;
+  if (!wavFile) return;
 
-  if (!wavFile)
-  {
-    return;
-  }
-  
-  riffSize = 36 + wavDataBytes;
-
+  uint32_t riffSize = 36 + wavDataBytes;
   wavFile.seek(4);  wavFile.write((const uint8_t*)&riffSize,    4);
   wavFile.seek(40); wavFile.write((const uint8_t*)&wavDataBytes, 4);
   wavFile.flush();
   wavFile.close();
 
-  sec = (float)wavDataBytes / (float)(WAV_SAMPLE_RATE * 2);
+  float sec = (float)wavDataBytes / (float)(WAV_SAMPLE_RATE * 2);
   wavLog("[WAV] Saved %s  (%.2f sec, %u bytes)\n", wavFileName, sec, wavDataBytes);
 }
 
@@ -354,75 +362,86 @@ static void wavStartRecording(bool sd)
 {
   if (!sd) { Serial.println("[WAV] SD not ready"); return; }
   if (!openNewWavFile()) return;
-  sdDebugOpen(wavFileName);  // WAV 파일과 동일한 이름의 .log 파일 열기
 
-  // ADC 간섭 방지: 녹음 전 WiFi OFF
-  webServerStop();
+  sdDebugOpen(wavFileName);
+
+  // WiFi는 계속 ON 유지 (방수 기구물 — 물리 버튼 접근 불가, 웹 전용 제어)
+  // ADC1 (GPIO1)은 ESP32-S3에서 WiFi와 별도 하드웨어 블록 → 간섭 최소
+  // TX 파워 절감으로 VDD 리플 노이즈 추가 감소
+  esp_wifi_set_max_tx_power(40);            // 20dBm → 10dBm
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);       // Beacon DTIM 슬립 (TX 간격 증가)
 
   wavFillBuf  = 0;
   wavFillPos  = 0;
   wavFlushReq = false;
   wavISRCount = 0;
+  wavStartMs  = millis();
 
-  // 필터 상태 초기화 (이전 녹음의 과도 응답 차단)
+  // 필터 상태 초기화
   hpFilter.w1 = hpFilter.w2 = 0.0f;
-  lpFilter.w1 = lpFilter.w2 = 0.0f;
-  rngState = (uint32_t)esp_timer_get_time();  // 디더 난수 시드
+  lpState = 0.0f;
+  rngState = (uint32_t)esp_timer_get_time();
 
-  wavState    = WAV_RECORDING;
+  wavState = WAV_RECORDING;
   ledSetState(LED_LOGGING);
+  webSetRecording(true);  // 웹 UI → STOP 버튼으로 전환
 
-  // 타이머 주기를 WAV_SAMPLE_RATE에서 자동 계산 (analogRead 제약: 10kHz 이하 권장)
   esp_timer_start_periodic(wavEspTimer, 1000000UL / WAV_SAMPLE_RATE);
-  wavLog("[WAV] Recording %d sec → %s\n", WAV_RECORD_SECONDS, wavFileName);
+  wavLog("[WAV] Recording started -> %s  (press STOP to finish)\n", wavFileName);
 }
 
 static void wavStopRecording(bool sd)
 {
   esp_timer_stop(wavEspTimer);
   wavState = WAV_SAVING;
+  ledSetState(LED_BOOTING);
+
+  webSetRecording(false);   // 웹 UI → REC 버튼으로 복귀
+  esp_wifi_set_ps(WIFI_PS_NONE);  // 슬립 해제 (응답 속도 복구)
 
   if (!sd || !wavFile)
   {
     wavState = WAV_STANDBY;
+    sdDebugClose();
     return;
   }
 
-  const uint32_t maxBytes = (uint32_t)WAV_RECORD_SECONDS * WAV_SAMPLE_RATE * 2;
-
-  // Flush full buffer that completed just before stop
+  // 완료된 더블 버퍼 플러시
   if (wavFlushReq)
   {
-    uint32_t need  = (wavDataBytes < maxBytes) ? maxBytes - wavDataBytes : 0;
-    uint32_t bytes = min((uint32_t)(WAV_BUF_SAMPLES * 2), need);
-    if (bytes) { wavFile.write((const uint8_t*)wavBuf[wavFlushBuf], bytes); wavDataBytes += bytes; }
+    wavFile.write((const uint8_t*)wavBuf[wavFlushBuf], WAV_BUF_SAMPLES * 2);
+    wavDataBytes += (uint32_t)(WAV_BUF_SAMPLES * 2);
     wavFlushReq = false;
   }
 
-  // Flush partial (incomplete) buffer up to target length
+  // 부분 채워진 버퍼 플러시
+  if (wavFillPos > 0)
   {
-    uint32_t need  = (wavDataBytes < maxBytes) ? maxBytes - wavDataBytes : 0;
-    uint32_t avail = (uint32_t)wavFillPos * 2;
-    uint32_t bytes = min(avail, need);
-    if (bytes) { wavFile.write((const uint8_t*)wavBuf[wavFillBuf], bytes); wavDataBytes += bytes; }
+    wavFile.write((const uint8_t*)wavBuf[wavFillBuf], wavFillPos * 2);
+    wavDataBytes += (uint32_t)(wavFillPos * 2);
   }
 
   closeWavFile();
-  analyzeFFT();               // 원본 파일로 FFT 주파수 분석
+
+  uint32_t totalSamples = wavDataBytes / 2;
+  float    totalSec     = (float)wavDataBytes / (float)(WAV_SAMPLE_RATE * 2);
+
+  wavLog("[WAV] Total: %.2f sec (%u samples)\n", totalSec, totalSamples);
+
+  analyzeFFT(totalSamples);
+
 #if WAV_NORMALIZE
-  normalizeWavFile();         // 재생 음량 정규화 (선택, config.h에서 제어)
+  normalizeWavFile(totalSamples);
 #endif
-  wavLog("[WAV] Standby. Press BOOT button to record.\n");
-  sdDebugClose();             // 로그 파일 닫기
+
+  wavLog("[WAV] Standby. Press REC in browser to start recording.\n");
+  sdDebugClose();
   wavState = WAV_STANDBY;
-  ledSetState(LED_BOOTING);   // white = standby
-  webServerBegin();           // 녹음 완료 후 WiFi ON + 웹서버 재시작
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
 void wavRecorderInit()
 {
-  // FFT 버퍼를 PSRAM에 동적 할당 (Core 1에서만 접근하므로 캐시 문제 없음)
   fftReal = (float*)heap_caps_malloc(FFT_SIZE * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   fftImag = (float*)heap_caps_malloc(FFT_SIZE * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
@@ -434,25 +453,26 @@ void wavRecorderInit()
 
   analogSetPinAttenuation(WAV_ADC_PIN, ADC_11db);
   pinMode(WAV_ADC_PIN,     INPUT);
+  // 물리 버튼 핀은 비상 디버그용으로만 초기화
   pinMode(WAV_TRIGGER_PIN, INPUT_PULLUP);
 
-  esp_timer_create_args_t cfg =
-  {
-    .callback             = wavTimerCb,
-    .arg                  = NULL,
-    .dispatch_method      = ESP_TIMER_TASK,
-    .name                 = "wavADC",
+  esp_timer_create_args_t cfg = {
+    .callback              = wavTimerCb,
+    .arg                   = NULL,
+    .dispatch_method       = ESP_TIMER_TASK,
+    .name                  = "wavADC",
     .skip_unhandled_events = true
   };
   esp_timer_create(&cfg, &wavEspTimer);
 
-  Serial.printf("Piezo WAV  ADC=GPIO%d  Trigger=GPIO%d (BOOT)\n",
-    WAV_ADC_PIN, WAV_TRIGGER_PIN);
+  Serial.printf("[WAV] MEMS Mic  ADC=GPIO%d  SR=%dHz  MaxRec=%dsec\n",
+    WAV_ADC_PIN, WAV_SAMPLE_RATE, WAV_MAX_RECORD_SEC);
+  Serial.println("[WAV] Filter: HP 80Hz + LP 3600Hz @ 8000Hz (MEMS mic)");
 }
 
 void wavLoop(bool sd, unsigned long now)
 {
-  // SD 카드 재삽입 감지: 대기 상태에서 SD 오류 시 3초마다 재마운트 시도
+  // ── SD 재삽입 감지 (대기 상태에서 3초마다 재마운트 시도) ──────────────
   if (wavState == WAV_STANDBY && !sdReady)
   {
     static unsigned long lastRemount = 0;
@@ -468,26 +488,32 @@ void wavLoop(bool sd, unsigned long now)
     }
   }
 
-  // Button detection (GPIO0 active LOW, 50 ms debounce)
+  // ── 웹 REC 버튼 ──────────────────────────────────────────────────────────
+  if (wavState == WAV_STANDBY && webRecordConsumed())
+    wavStartRecording(sd);
+
+  // ── 웹 STOP 버튼 ─────────────────────────────────────────────────────────
+  if (wavState == WAV_RECORDING && webStopConsumed())
+    wavStopRecording(sd);
+
+  // ── 비상 물리 버튼 (방수 기구물에서는 정상 미사용, 디버그 전용) ──────────
+#if 0
   static bool          lastBtn     = HIGH;
   static unsigned long lastBtnTime = 0;
   bool btn = (bool)digitalRead(WAV_TRIGGER_PIN);
-
   if (btn != lastBtn && (now - lastBtnTime) > 50)
   {
     lastBtnTime = now;
     lastBtn     = btn;
-    if (btn == LOW && wavState == WAV_STANDBY)
-      wavStartRecording(sd);
+    if (btn == LOW && wavState == WAV_STANDBY)   wavStartRecording(sd);
+    if (btn == LOW && wavState == WAV_RECORDING) wavStopRecording(sd);
   }
+#endif
 
-  // 웹 버튼 트리거 (버튼0과 동일한 동작)
-  if (wavState == WAV_STANDBY && webRecordConsumed())
-    wavStartRecording(sd);
-
-  // Flush full buffers to SD while recording
+  // ── 녹음 중 처리 ─────────────────────────────────────────────────────────
   if (wavState == WAV_RECORDING)
   {
+    // 더블버퍼 → SD 플러시
     if (wavFlushReq && wavFile)
     {
       uint8_t bi = wavFlushBuf;
@@ -496,20 +522,41 @@ void wavLoop(bool sd, unsigned long now)
       wavFlushReq = false;
     }
 
-    // Progress print every 500 ms
+    // 경과 시간 계산 및 웹 UI 갱신 (500ms마다)
     static unsigned long lastPrint = 0;
     if (now - lastPrint >= 500)
     {
       lastPrint = now;
-      float elapsed = (float)wavISRCount / (float)WAV_SAMPLE_RATE;
-      wavLog("  %.1f / %d sec  (%.1f sec left)\n",
-        elapsed, WAV_RECORD_SECONDS,
-        max(0.0f, (float)WAV_RECORD_SECONDS - elapsed));
+      float    elapsed    = (float)wavISRCount / (float)WAV_SAMPLE_RATE;
+      uint32_t elapsedSec = (uint32_t)elapsed;
+      webSetElapsed(elapsedSec);  // 웹 페이지 경과 시간 갱신
+
+      // SD 여유 공간 체크 (5초마다)
+      static unsigned long lastSpaceCheck = 0;
+      if (now - lastSpaceCheck >= 5000)
+      {
+        lastSpaceCheck = now;
+        uint64_t freeMB = (SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL);
+        if (freeMB < (uint64_t)WAV_SD_RESERVE_MB)
+        {
+          wavLog("[WAV] SD free space low (%llu MB) — auto stop\n", freeMB);
+          wavStopRecording(sd);
+          return;
+        }
+      }
+
+      wavLog("  %.1f sec  (%u bytes)  SD free: %llu MB\n",
+        elapsed,
+        wavDataBytes,
+        (SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024ULL * 1024ULL));
     }
 
-    // Stop when enough samples captured
-    if (wavISRCount >= (uint32_t)WAV_RECORD_SECONDS * WAV_SAMPLE_RATE)
+    // 안전 최대 시간 초과 → 자동 종료
+    if (wavISRCount >= (uint32_t)WAV_MAX_RECORD_SEC * WAV_SAMPLE_RATE)
+    {
+      wavLog("[WAV] Max record time (%d sec) reached — auto stop\n", WAV_MAX_RECORD_SEC);
       wavStopRecording(sd);
+    }
   }
 }
 
