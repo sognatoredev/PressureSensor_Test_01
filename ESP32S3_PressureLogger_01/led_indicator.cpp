@@ -48,6 +48,12 @@ void ledSetState(LedState s)
   ledState = s;
 }
 
+void ledOff()
+{
+  rgbLed.clear();
+  rgbLed.show();
+}
+
 void ledUpdate()
 {
   static unsigned long lastToggle = 0;
@@ -86,6 +92,10 @@ void ledUpdate()
       color = rgbLed.Color(60, 0, 60);  blink=true; interval=150;   break;
     case LED_SENSOR_DISCONNECTED:
       color = rgbLed.Color(60, 0, 0);                                break;
+
+    case LED_SLEEPING:
+      // 주황색 느린 깜빡임 (1.5 s 주기) — DeepSleep 직전 시각적 알림
+      color = rgbLed.Color(80, 30, 0);   blink=true; interval=1500; break;
   }
 
   if (blink)

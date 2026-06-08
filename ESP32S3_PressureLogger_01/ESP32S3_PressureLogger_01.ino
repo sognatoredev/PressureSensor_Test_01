@@ -61,6 +61,10 @@
   #include "web_server.h"
 #endif
 
+#if (SENSOR_TYPE == 2 || SENSOR_TYPE == 3) && USE_DEEPSLEEP
+  #include "deep_sleep.h"
+#endif
+
 static bool sensorReady = false;
 
 #if SENSOR_TYPE == 0
@@ -78,6 +82,15 @@ void setup()
   ledSetState(LED_BOOTING);
   ledUpdate();
   delay(500);
+
+  // ── DeepSleep: Wake-Up 소스 등록 (재부팅마다 필요) ──────────────────────
+#if (SENSOR_TYPE == 2 || SENSOR_TYPE == 3) && USE_DEEPSLEEP
+  deepSleepInit();
+  if (deepSleepIsWakeup())
+    Serial.println("[SLEEP] <<< Woke from DeepSleep (reed switch trigger) >>>");
+  else
+    Serial.println("[SLEEP] Cold boot  (not a DeepSleep wake-up)");
+#endif
 
   Serial.println("=========================================");
 #if SENSOR_TYPE == 2

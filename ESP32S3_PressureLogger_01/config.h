@@ -116,6 +116,23 @@
 
 #define MDNS_HOSTNAME   "esp32sensor"
 
+// ==================== DeepSleep  (SENSOR_TYPE 2 / 3) ====================
+// 방수 기구물 내장 — 물리 버튼 없음, 리드스위치로 Wake-Up
+//
+// 회로 (외부 저항 불필요):
+//   3.3V ─── 리드스위치 ─── GPIO3 ─── 내부 풀다운 (~45 kΩ) ─── GND
+//
+//   자석 없음 : 스위치 OPEN  → GPIO3 = LOW  (풀다운)
+//   자석 있음 : 스위치 CLOSE → GPIO3 = HIGH (3.3V 인가)
+//
+// Wake-Up: GPIO3 = HIGH → esp_sleep_enable_ext0_wakeup(GPIO_NUM_3, 1)
+// 슬립 진입 조건: 녹음 종료 후 SLEEP_IDLE_SEC 동안 대기 상태 유지
+//                 + 리드스위치 비활성(GPIO3 = LOW) — 활성 중이면 즉시 재기상 방지
+#define USE_DEEPSLEEP       1     // 1 = 활성화 / 0 = 비활성화
+#define SLEEP_TRIGGER_PIN   3     // GPIO3  (RTC GPIO, 내부 풀다운)
+#define SLEEP_WAKE_LEVEL    1     // Wake-Up 레벨: 1 = HIGH (리드스위치 3.3V)
+#define SLEEP_IDLE_SEC      60    // 대기 → 슬립 전환 시간 (초)
+
 // ==================== RGB LED (WS2812B - GPIO48) ====================
 #define RGB_LED_PIN       48
 #define RGB_LED_COUNT      1

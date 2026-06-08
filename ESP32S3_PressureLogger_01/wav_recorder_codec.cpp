@@ -24,7 +24,15 @@
 #include <driver/i2s.h>
 #include "led_indicator.h"
 #include "web_server.h"
-#include <arduinoFFT.h>
+#include "deep_sleep.h"
+#include "kiss_fft.h"
+
+// ── 강도 분석 알고리즘 상수 (Python analysis.py / 검증된 KissFFT 구현과 동일) ──
+#define MAX_ANALYSIS_FREQ_HZ  3000  // Python: tfa_data[0:3000]
+#define SKIP_LOW_FREQ_HZ      50    // Python: tfa_data[:50] = 0
+#define ENERGY_HALF_WIN       10    // Python: avg[idx-10 : idx+10]
+#define ANALYSIS_MAX_SEC      3     // 강도 분석은 시작부터 최대 3초 구간만 사용
+                                    //  → 녹음 길이 무관 동일 구간 분석(일관성) + 대용량 파일 read 오류 방지
 
 // ── 상태 머신 ──────────────────────────────────────────────────────────────
 enum CodecWavState { CODEC_STANDBY, CODEC_RECORDING, CODEC_SAVING };
@@ -46,6 +54,8 @@ static uint32_t codecSampleCount = 0;
 static int16_t  codecPcmMin     = 0;
 static int16_t  codecPcmMax     = 0;
 static uint32_t codecNonZero    = 0;   // 0이 아닌 샘플 수
+static uint32_t codecClipCount  = 0;   // int16 레일(±32767) 근접 샘플 수
+#define CODEC_CLIP_MARGIN  64           // 레일 ±64 이내면 포화로 간주
 
 // ── 오프라인 FFT 버퍼 (PSRAM 동적 할당) ──────────────────────────────────
 //   CODEC_FFT_SIZE = 32768 (2^15): 제로패딩 후 FFT 포인트 수
@@ -298,6 +308,7 @@ static void codecStartRecording(bool sd)
   codecPcmMin      = 0;
   codecPcmMax      = 0;
   codecNonZero     = 0;
+  codecClipCount   = 0;
   rawBufPos        = 0;
 
   writeWavHeader(codecFile, 0);  // 크기는 종료 시 업데이트
@@ -366,84 +377,201 @@ static void normalizeWavFile()
   Serial.printf("[NORM] Done: %u samples normalized\n", count);
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 오프라인 FFT 피크 주파수 분석 (esp-dsp, 녹음 종료 후 1회 실행)
-// ─────────────────────────────────────────────────────────────────────────
-static void analyzeFFT()
+// ── 헬퍼: |x| 평균 기준 표준편차 (Python: np.std(abs(slice))) ───────────────
+static float stdAbsFloat(const float *arr, int n)
 {
-  if (!fftReal || !fftImag) { Serial.println("[FFT] Buffer not ready, skipping."); return; }
-  if (!rawBuf || rawBufPos == 0) { Serial.println("[FFT] Raw buffer empty, skipping."); return; }
-
-  uint32_t captureSize = min(rawBufPos, (uint32_t)CODEC_FFT_CAPTURE_SIZE);
-  float    winScale    = 1.0f / (float)(captureSize - 1);
-
-  // Hamming 윈도우 적용 + 허수부 0 초기화 + 제로패딩
-  for (uint32_t i = 0; i < captureSize; i++)
+  float sum = 0.0f;
+  for (int i = 0; i < n; i++) sum += fabsf(arr[i]);
+  float mean = sum / (float)n;
+  float s = 0.0f;
+  for (int i = 0; i < n; i++)
   {
-    float win   = 0.54f - 0.46f * cosf(TWO_PI * (float)i * winScale);
-    fftReal[i]  = win * (float)rawBuf[i];
-    fftImag[i]  = 0.0f;
+    float v = fabsf(arr[i]) - mean;
+    s += v * v;
   }
-  memset(&fftReal[captureSize], 0, (CODEC_FFT_SIZE - captureSize) * sizeof(float));
-  memset(&fftImag[captureSize], 0, (CODEC_FFT_SIZE - captureSize) * sizeof(float));
+  return sqrtf(s / (float)n);
+}
 
-  // arduinoFFT (크기 제한 없음, 안정적)
-  ArduinoFFT<float> FFT(fftReal, fftImag, CODEC_FFT_SIZE, (float)NAU88_SAMPLE_RATE);
-  FFT.compute(FFTDirection::Forward);
-  FFT.complexToMagnitude();  // fftReal[i] = magnitude[i]
+// ── 헬퍼: WAV PCM16 모노 샘플 읽기 → float [-1.0, 1.0] ───────────────────────
+// 본 레코더 WAV는 항상 8000Hz·16bit·모노·헤더 44바이트 고정 포맷
+static bool wavReadSamples(File &f, uint32_t startFrame, uint32_t count, float *out)
+{
+  if (!f.seek(44 + (size_t)startFrame * 2)) return false;
 
-  // 피크 탐색: DC 제외, 60 Hz + 고조파 노치 (1~17th), 상위 5개 피크 추출
-  const uint32_t binNyq   = CODEC_FFT_SIZE / 2;
-  const float    binHz    = (float)NAU88_SAMPLE_RATE / (float)CODEC_FFT_SIZE;
-
-  // 60 Hz 기본파 + 고조파 노치 범위 사전 계산 (±1 Hz 폭)
-  // → 60, 120, 180, ... 1020, 1080 Hz (Nyquist 4000 Hz 이내 최대 66th)
-  const float  notchBase  = 60.0f;
-  const float  notchWidth = 1.5f;  // ±1.5 Hz
-
-  // 상위 5개 피크 (빈 인덱스 + 크기)
-  const int    TOP_N = 5;
-  float    topMag[TOP_N] = {};
-  uint32_t topBin[TOP_N] = {};
-
-  for (uint32_t b = 1; b < binNyq; b++)
+  uint8_t  buf[512];
+  uint32_t done = 0;
+  while (done < count)
   {
-    // 60 Hz 고조파 노치: 해당 빈의 주파수가 60 Hz 배수 ±1.5 Hz 이내면 제외
-    float freq = b * binHz;
-    float rem  = fmodf(freq, notchBase);
-    if (rem < notchWidth || rem > (notchBase - notchWidth)) continue;
+    uint32_t toRead = min((uint32_t)sizeof(buf), (count - done) * 2);
+    int got = f.read(buf, toRead);
+    if (got <= 0) return false;
 
-    float mag = fftReal[b];
-    // 최솟값 슬롯에 삽입
-    int minIdx = 0;
-    for (int k = 1; k < TOP_N; k++)
-      if (topMag[k] < topMag[minIdx]) minIdx = k;
-    if (mag > topMag[minIdx]) { topMag[minIdx] = mag; topBin[minIdx] = b; }
+    int frames = got / 2;
+    for (int j = 0; j < frames && done < count; j++, done++)
+    {
+      int16_t s = (int16_t)((uint16_t)buf[j*2] | ((uint16_t)buf[j*2 + 1] << 8));
+      out[done] = (float)s / 32768.0f;
+    }
   }
-  // 내림차순 정렬 (버블)
-  for (int a = 0; a < TOP_N - 1; a++)
-    for (int b2 = a + 1; b2 < TOP_N; b2++)
-      if (topMag[b2] > topMag[a]) {
-        float  tm = topMag[a]; topMag[a] = topMag[b2]; topMag[b2] = tm;
-        uint32_t tb = topBin[a]; topBin[a] = topBin[b2]; topBin[b2] = tb;
-      }
+  return true;
+}
 
-  Serial.println("─────────────────────────────────");
-  Serial.printf("[FFT] Source     : RAW PCM (no SW filter)\n");
-  Serial.printf("[FFT] Signal     : %u samples (%.3f sec)\n",
-    captureSize, (float)captureSize / NAU88_SAMPLE_RATE);
-  Serial.printf("[FFT] Zero-pad   : %u → %u  Resolution: %.3f Hz/bin\n",
-    captureSize, CODEC_FFT_SIZE, binHz);
-  Serial.printf("[FFT] 60Hz notch : %.0f Hz fundamental + harmonics (+-%.1f Hz)\n",
-    notchBase, notchWidth);
-  Serial.println("[FFT] Top peaks:");
-  for (int k = 0; k < TOP_N; k++)
+// ── 강도 분석 (KissFFT · Python analysis.py 와 동일 알고리즘 / SENSOR_TYPE 2와 동일) ──
+// 핵심: fftSize = 샘플레이트(8000) → 1 bin = 1 Hz → 정수 Hz 신호가 bin 중심에
+//       정확히 정렬되어 스펙트럼 누설(leakage) 제거 → 반복 측정 강도값 안정
+//
+//   STEP1  표준편차 최소 1초 윈도우 탐색 (가장 안정적인 정상 진동 구간 선택)
+//   STEP2  KissFFT (윈도우 함수 없음 = scipy.fftpack.fft 와 동일)
+//   STEP3  저주파 제거 (0 ~ 49 Hz = 0)
+//   STEP4  피크 주파수 탐색 (50 ~ 3000 Hz)
+//   STEP5  wave_energy = mean(peak ±10 bins)  ← 최종 강도값
+//
+// ※ 반드시 정규화(normalizeWavFile) 이전에 호출 — 원본 신호 기준 강도 측정
+// 반환값: wave_energy (캘리브레이션 기준 저장 및 보정 강도 계산에 사용)
+static float analyzeFFT(uint32_t totalSamples)
+{
+  const int sr       = NAU88_SAMPLE_RATE;               // 8000
+  const int sec_0_1  = sr / 10;                         // 800  (0.1초)
+  const int sec_1    = sr;                              // 8000 (1초 = fftSize)
+  const int fftSize  = sec_1;
+
+  // 분석 구간: 시작부터 최대 ANALYSIS_MAX_SEC(3초)까지만 (파일이 길어도 동일 구간)
+  uint32_t  analyzeSamples = min(totalSamples, (uint32_t)(ANALYSIS_MAX_SEC * sr));
+  const int totalFr  = (int)analyzeSamples;
+  const int time_l   = totalFr / sec_1;                 // 정수 초 길이 (≤ 3)
+  const int i_time   = (time_l - 1) * 10 - 1;           // 윈도우 스캔 횟수 (3초→19회)
+
+  const int skipBins = SKIP_LOW_FREQ_HZ;                // 50
+  const int numBins  = min(MAX_ANALYSIS_FREQ_HZ, fftSize / 2);  // 3000
+
+  if (i_time <= 0)
   {
-    if (topMag[k] == 0.0f) continue;
-    Serial.printf("  #%d  %7.2f Hz  Magnitude: %.1f\n",
-      k + 1, topBin[k] * binHz, topMag[k]);
+    Serial.println("[FFT] Audio too short (need >= 2 sec) — skip analysis.");
+    return 0.0f;
   }
-  Serial.println("─────────────────────────────────");
+
+  File f = SD_MMC.open(codecFileName, FILE_READ);
+  if (!f)
+  {
+    Serial.printf("[FFT] Cannot open %s\n", codecFileName);
+    return 0.0f;
+  }
+
+  // ── STEP1: 표준편차 최소 윈도우 탐색 ──────────────────────────────────────
+  float *tmpBuf = (float*)ps_malloc((size_t)sec_1 * sizeof(float));
+  if (!tmpBuf)  tmpBuf = (float*)malloc((size_t)sec_1 * sizeof(float));
+  if (!tmpBuf) { Serial.println("[FFT] tmpBuf alloc fail"); f.close(); return 0.0f; }
+
+  float minStd  = 1e30f;
+  int   bestIdx = 0;
+  for (int i = 0; i < i_time; i++)
+  {
+    uint32_t startFrame = (uint32_t)(i + 1) * sec_0_1;
+    if (!wavReadSamples(f, startFrame, (uint32_t)sec_1, tmpBuf))
+    {
+      Serial.printf("[FFT] read error (i=%d)\n", i);
+      free(tmpBuf); f.close(); return 0.0f;
+    }
+    float s = stdAbsFloat(tmpBuf, sec_1);
+    if (s < minStd) { minStd = s; bestIdx = i; }
+  }
+  free(tmpBuf);
+
+  const int a = bestIdx + 1;
+
+  // ── STEP2: KissFFT (fftSize = 8000, 윈도우 함수 없음) ─────────────────────
+  float        *audioBuf = (float*)ps_malloc((size_t)fftSize * sizeof(float));
+  kiss_fft_cpx *fftIn    = (kiss_fft_cpx*)ps_malloc((size_t)fftSize * sizeof(kiss_fft_cpx));
+  kiss_fft_cpx *fftOut   = (kiss_fft_cpx*)ps_malloc((size_t)fftSize * sizeof(kiss_fft_cpx));
+  float        *mag      = (float*)ps_malloc((size_t)fftSize * sizeof(float));
+
+  if (!audioBuf) audioBuf = (float*)malloc((size_t)fftSize * sizeof(float));
+  if (!fftIn)    fftIn    = (kiss_fft_cpx*)malloc((size_t)fftSize * sizeof(kiss_fft_cpx));
+  if (!fftOut)   fftOut   = (kiss_fft_cpx*)malloc((size_t)fftSize * sizeof(kiss_fft_cpx));
+  if (!mag)      mag      = (float*)malloc((size_t)fftSize * sizeof(float));
+
+  if (!audioBuf || !fftIn || !fftOut || !mag)
+  {
+    Serial.println("[FFT] FFT buffer alloc fail");
+    free(audioBuf); free(fftIn); free(fftOut); free(mag);
+    f.close(); return 0.0f;
+  }
+
+  const uint32_t fftStart = (uint32_t)a * sec_0_1;
+  if (!wavReadSamples(f, fftStart, (uint32_t)fftSize, audioBuf))
+  {
+    Serial.println("[FFT] FFT window read fail");
+    free(audioBuf); free(fftIn); free(fftOut); free(mag);
+    f.close(); return 0.0f;
+  }
+  f.close();
+
+  for (int i = 0; i < fftSize; i++) { fftIn[i].r = audioBuf[i]; fftIn[i].i = 0.0f; }
+  free(audioBuf);
+
+  // cfg는 PSRAM에 배치 (twiddle 테이블 ~64KB)
+  size_t cfgLen = 0;
+  kiss_fft_alloc(fftSize, 0, NULL, &cfgLen);           // 필요 크기 산출
+  void *cfgMem = ps_malloc(cfgLen);
+  if (!cfgMem) cfgMem = malloc(cfgLen);
+  kiss_fft_cfg cfg = kiss_fft_alloc(fftSize, 0, cfgMem, &cfgLen);
+  if (!cfg)
+  {
+    Serial.println("[FFT] KissFFT cfg alloc fail");
+    free(cfgMem); free(fftIn); free(fftOut); free(mag);
+    return 0.0f;
+  }
+
+  kiss_fft(cfg, fftIn, fftOut);
+  free(cfgMem);
+  free(fftIn);
+
+  // 크기 스펙트럼: |FFT[k]| = sqrt(re²+im²)  (Python: abs(fft(...)))
+  for (int i = 0; i < fftSize; i++)
+    mag[i] = sqrtf(fftOut[i].r * fftOut[i].r + fftOut[i].i * fftOut[i].i);
+  free(fftOut);
+
+  // ── STEP3: 저주파 제거 (Python: tfa_data3000[:50] = 0) ───────────────────
+  for (int i = 0; i < skipBins; i++) mag[i] = 0.0f;
+
+  // ── STEP4: 피크 탐색 (Python: idx = argmax(tfa_data3000)) ────────────────
+  int peakBin = skipBins;
+  for (int i = skipBins + 1; i < numBins; i++)
+    if (mag[i] > mag[peakBin]) peakBin = i;
+  const float peakFreqHz = (float)peakBin;   // 1 bin = 1 Hz
+
+  // ── STEP5: wave_energy = 피크 ±10 bins 평균 (Python: wave_energy) ────────
+  const int eStart = max(0, peakBin - ENERGY_HALF_WIN);
+  const int eStop  = min(numBins, peakBin + ENERGY_HALF_WIN);
+  float eSum = 0.0f;
+  for (int i = eStart; i < eStop; i++) eSum += mag[i];
+  const float waveEnergy = eSum / (float)(eStop - eStart);
+
+  // ── (보조) 표준편차 — Python: np.std(tfa_data) ───────────────────────────
+  float magSum = 0.0f;
+  for (int i = 0; i < numBins; i++) magSum += mag[i];
+  const float magMean = magSum / (float)numBins;
+  float varSum = 0.0f;
+  for (int i = 0; i < numBins; i++) { float d = mag[i] - magMean; varSum += d * d; }
+  const float stdDev = sqrtf(varSum / (float)numBins);
+
+  free(mag);
+
+  // ── 결과 출력 ─────────────────────────────────────────────────────────────
+  Serial.println("---------------------------------");
+  Serial.printf("[FFT] Total      : %.2f sec (%u samples)\n",
+    (float)totalSamples / sr, totalSamples);
+  Serial.printf("[FFT] Analyze    : first %.2f sec (%d samples)\n",
+    (float)totalFr / sr, totalFr);
+  Serial.printf("[FFT] Window     : a=%d  std=%.6f  start=%.3f sec  (scan %d)\n",
+    a, minStd, (float)(a * sec_0_1) / sr, i_time);
+  Serial.printf("[FFT] FFT size   : %d  (res 1.000 Hz/bin)\n", fftSize);
+  Serial.printf("[FFT] Peak Freq  : %.0f Hz\n", peakFreqHz);
+  Serial.printf("[FFT] Intensity  : %.6f  (mean +-10 bins)\n", waveEnergy);
+  Serial.printf("[FFT] Std Dev    : %.6f\n", stdDev);
+  Serial.println("---------------------------------");
+
+  return waveEnergy;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -479,19 +607,31 @@ static void codecStopRecording(bool sd)
   codecFile.close();
 
   float sec = (float)codecDataBytes / (float)(NAU88_SAMPLE_RATE * 2);
-  Serial.println("─────────────────────────────────");
+  Serial.println("---------------------------------");
   Serial.printf("[CODEC] Saved  : %s\n", codecFileName);
   Serial.printf("[CODEC] Size   : %u bytes  (%.2f sec)\n", codecDataBytes, sec);
   Serial.printf("[CODEC] Samples: %u  NonZero: %u (%.1f%%)\n",
     codecSampleCount, codecNonZero,
     codecSampleCount ? (100.0f * codecNonZero / codecSampleCount) : 0.0f);
-  Serial.printf("[CODEC] PCM    : min=%d  max=%d\n", codecPcmMin, codecPcmMax);
+  Serial.printf("[CODEC] PCM    : min=%d  max=%d  (16bit ±32768)\n", codecPcmMin, codecPcmMax);
+  {
+    float clipPct = codecSampleCount ? (100.0f * (float)codecClipCount / (float)codecSampleCount) : 0.0f;
+    Serial.printf("[CODEC] Clipping: %.2f%%  (%u / %u samples near rail +/-%d)\n",
+      clipPct, codecClipCount, codecSampleCount, CODEC_CLIP_MARGIN);
+    if (clipPct >= 1.0f)
+      Serial.println("[CODEC] !! Saturation -- reduce input gain (intensity unreliable)");
+    else if (codecPcmMin <= -32000 || codecPcmMax >= 32000)
+      Serial.println("[CODEC] ! Near full-scale -- insufficient headroom (reduce gain)");
+  }
   if (codecNonZero == 0)
     Serial.println("[CODEC] !! ALL ZERO — ADCOUT not driven. Check MCLK/wiring.");
-  Serial.println("─────────────────────────────────");
+  Serial.println("---------------------------------");
 
-  normalizeWavFile();   // 피크 탐색 → 게인 적용 → 재기록
-  analyzeFFT();         // FFT 주파수 분석
+  // ★ 강도 분석은 정규화 이전(원본 신호 기준)에 수행
+  uint32_t totalSamples = codecDataBytes / 2;
+  analyzeFFT(totalSamples);   // KissFFT 주파수/강도 분석 (Intensity 출력)
+
+  normalizeWavFile();   // 피크 탐색 → 게인 적용 → 재기록 (재생 음량 정규화)
 
   codecState = CODEC_STANDBY;
   ledSetState(LED_BOOTING);
@@ -503,16 +643,16 @@ static void codecStopRecording(bool sd)
 // ─────────────────────────────────────────────────────────────────────────
 void codecRecorderInit()
 {
-  // ── 오프라인 FFT 버퍼 PSRAM 할당 (arduinoFFT) ───────────────────────────
-  //   fftReal + fftImag 각 128 KB = 합계 256 KB PSRAM
+  // ── 정규화(normalizeWavFile) 전용 버퍼 PSRAM 할당 ───────────────────────
+  //   강도 분석(analyzeFFT)은 KissFFT 자체 버퍼를 on-demand 할당하므로
+  //   여기 fftReal/fftImag는 normalizeWavFile 피크 탐색 버퍼로만 사용
   fftReal = (float*)heap_caps_malloc(CODEC_FFT_SIZE * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   fftImag = (float*)heap_caps_malloc(CODEC_FFT_SIZE * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!fftReal || !fftImag)
     Serial.println("[FFT] PSRAM alloc failed!");
   else
-    Serial.printf("[FFT] PSRAM alloc OK: %u KB  Resolution=%.3f Hz/bin\n",
-      (uint32_t)(CODEC_FFT_SIZE * sizeof(float) * 2 / 1024),
-      (float)NAU88_SAMPLE_RATE / (float)CODEC_FFT_SIZE);
+    Serial.printf("[FFT] PSRAM buffer OK: %u KB\n",
+      (uint32_t)(CODEC_FFT_SIZE * sizeof(float) * 2 / 1024));
 
   // 원 데이터 버퍼 PSRAM 할당 (필터 적용 전 I2S 원본)
   rawBuf = (int16_t*)heap_caps_malloc(CODEC_FFT_CAPTURE_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -588,6 +728,7 @@ void codecLoop(bool sd, unsigned long now)
       if (s != 0) codecNonZero++;
       if (s < codecPcmMin) codecPcmMin = s;
       if (s > codecPcmMax) codecPcmMax = s;
+      if (s >= (32767 - CODEC_CLIP_MARGIN) || s <= (-32768 + CODEC_CLIP_MARGIN)) codecClipCount++;
 
       codecBuf[codecFillBuf][codecFillPos] = s;
       codecSampleCount++;
@@ -643,6 +784,30 @@ void codecLoop(bool sd, unsigned long now)
       codecStopRecording(sd);
     }
   }
+
+  // ── DeepSleep: SLEEP_IDLE_SEC 동안 대기 상태 유지 시 슬립 진입 ────────────
+#if USE_DEEPSLEEP
+  {
+    static bool          inStandby  = false;
+    static unsigned long standbyMs  = 0;
+
+    if (codecState == CODEC_STANDBY)
+    {
+      if (!inStandby) { inStandby = true; standbyMs = now; }
+
+      if ((now - standbyMs) >= (unsigned long)SLEEP_IDLE_SEC * 1000UL)
+      {
+        Serial.printf("[SLEEP] Standby for %d sec — attempting DeepSleep\n", SLEEP_IDLE_SEC);
+        deepSleepEnter();
+        standbyMs = now;  // 리드스위치 활성으로 반환된 경우 타이머 리셋
+      }
+    }
+    else
+    {
+      inStandby = false;  // 녹음/저장 중이면 타이머 리셋
+    }
+  }
+#endif
 }
 
 #endif // SENSOR_TYPE == 3

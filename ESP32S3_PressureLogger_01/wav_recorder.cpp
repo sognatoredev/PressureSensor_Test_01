@@ -10,7 +10,15 @@
 #include "led_indicator.h"
 #include "sd_logger.h"
 #include "web_server.h"
-#include <arduinoFFT.h>
+#include "deep_sleep.h"
+#include "kiss_fft.h"
+
+// ── 강도 분석 알고리즘 상수 (Python analysis.py / 검증된 KissFFT 구현과 동일) ──
+#define MAX_ANALYSIS_FREQ_HZ  3000  // Python: tfa_data[0:3000]
+#define SKIP_LOW_FREQ_HZ      50    // Python: tfa_data[:50] = 0
+#define ENERGY_HALF_WIN       10    // Python: avg[idx-10 : idx+10]
+#define ANALYSIS_MAX_SEC      3     // 강도 분석은 시작부터 최대 3초 구간만 사용
+                                    //  → 녹음 길이 무관 동일 구간 분석(일관성) + 대용량 파일 read 오류 방지
 
 // Serial 출력과 SD 로그 파일에 동시 기록
 static void wavLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -103,6 +111,12 @@ static volatile uint8_t  wavFlushBuf = 0;
 static volatile bool     wavFlushReq = false;
 static volatile uint32_t wavISRCount = 0;
 
+// ── 포화(클리핑) 진단 통계 (녹음 중 누적, 종료 시 출력) ────────────────────
+static volatile int      wavRawMin    = 4095;   // ADC 원본 최소 (0~4095)
+static volatile int      wavRawMax    = 0;       // ADC 원본 최대
+static volatile uint32_t wavClipCount = 0;       // ADC 레일(0/4095) 근접 샘플 수
+#define WAV_CLIP_MARGIN  4                        // 레일 ±4 이내면 포화로 간주
+
 // ── File tracking ──────────────────────────────────────────────────────────
 static File     wavFile;
 static char     wavFileName[32];
@@ -118,6 +132,12 @@ static esp_timer_handle_t wavEspTimer = NULL;
 static void wavTimerCb(void *arg)
 {
   int raw = analogRead(WAV_ADC_PIN);
+
+  // ── 포화 진단: ADC 원본 min/max + 레일 근접 카운트 ──────────────────────
+  if (raw < wavRawMin) wavRawMin = raw;
+  if (raw > wavRawMax) wavRawMax = raw;
+  if (raw <= WAV_CLIP_MARGIN || raw >= (4095 - WAV_CLIP_MARGIN)) wavClipCount++;
+
   // 12bit ADC 중심값(2048) 기준 부호 있는 값으로 변환, 4비트 좌쉬프트로 16bit 스케일
   float sample = (float)((raw - 2048) << 4);
 
@@ -204,83 +224,200 @@ static void normalizeWavFile(uint32_t sampleCount)
   wavLog("[NORM] Done: %u samples normalized\n", count);
 }
 
-// ── FFT Peak Frequency Analysis ───────────────────────────────────────────
-// 가변 길이 녹음 대응: 실제 녹음 샘플 수를 받아 최대 FFT_SIZE까지 분석
-static void analyzeFFT(uint32_t totalSamples)
+// ── 헬퍼: |x| 평균 기준 표준편차 (Python: np.std(abs(slice))) ───────────────
+static float stdAbsFloat(const float *arr, int n)
 {
-  if (!fftReal || !fftImag)
+  float sum = 0.0f;
+  for (int i = 0; i < n; i++) sum += fabsf(arr[i]);
+  float mean = sum / (float)n;
+  float s = 0.0f;
+  for (int i = 0; i < n; i++)
   {
-    wavLog("[FFT] Buffer not ready, skipping.\n");
-    return;
+    float v = fabsf(arr[i]) - mean;
+    s += v * v;
+  }
+  return sqrtf(s / (float)n);
+}
+
+// ── 헬퍼: WAV PCM16 모노 샘플 읽기 → float [-1.0, 1.0] ───────────────────────
+// 본 레코더 WAV는 항상 8000Hz·16bit·모노·헤더 44바이트 고정 포맷
+static bool wavReadSamples(File &f, uint32_t startFrame, uint32_t count, float *out)
+{
+  if (!f.seek(44 + (size_t)startFrame * 2)) return false;
+
+  uint8_t  buf[512];
+  uint32_t done = 0;
+  while (done < count)
+  {
+    uint32_t toRead = min((uint32_t)sizeof(buf), (count - done) * 2);
+    int got = f.read(buf, toRead);
+    if (got <= 0) return false;
+
+    int frames = got / 2;
+    for (int j = 0; j < frames && done < count; j++, done++)
+    {
+      int16_t s = (int16_t)((uint16_t)buf[j*2] | ((uint16_t)buf[j*2 + 1] << 8));
+      out[done] = (float)s / 32768.0f;
+    }
+  }
+  return true;
+}
+
+// ── 강도 분석 (KissFFT · Python analysis.py 와 동일 알고리즘) ────────────────
+// 핵심: fftSize = 샘플레이트(8000) → 1 bin = 1 Hz → 정수 Hz 신호가 bin 중심에
+//       정확히 정렬되어 스펙트럼 누설(leakage) 제거 → 반복 측정 강도값 안정
+//
+//   STEP1  표준편차 최소 1초 윈도우 탐색 (가장 안정적인 정상 진동 구간 선택)
+//   STEP2  KissFFT (윈도우 함수 없음 = scipy.fftpack.fft 와 동일)
+//   STEP3  저주파 제거 (0 ~ 49 Hz = 0)
+//   STEP4  피크 주파수 탐색 (50 ~ 3000 Hz)
+//   STEP5  wave_energy = mean(peak ±10 bins)  ← 최종 강도값
+//
+// 반환값: wave_energy (캘리브레이션 기준 저장 및 보정 강도 계산에 사용)
+static float analyzeFFT(uint32_t totalSamples)
+{
+  const int sr       = WAV_SAMPLE_RATE;                 // 8000
+  const int sec_0_1  = sr / 10;                         // 800  (0.1초)
+  const int sec_1    = sr;                              // 8000 (1초 = fftSize)
+  const int fftSize  = sec_1;
+
+  // 분석 구간: 시작부터 최대 ANALYSIS_MAX_SEC(3초)까지만 (파일이 길어도 동일 구간)
+  uint32_t  analyzeSamples = min(totalSamples, (uint32_t)(ANALYSIS_MAX_SEC * sr));
+  const int totalFr  = (int)analyzeSamples;
+  const int time_l   = totalFr / sec_1;                 // 정수 초 길이 (≤ 3)
+  const int i_time   = (time_l - 1) * 10 - 1;           // 윈도우 스캔 횟수 (3초→19회)
+
+  const int skipBins = SKIP_LOW_FREQ_HZ;                // 50
+  const int numBins  = min(MAX_ANALYSIS_FREQ_HZ, fftSize / 2);  // 3000
+
+  if (i_time <= 0)
+  {
+    wavLog("[FFT] Audio too short (need >= 2 sec) — skip analysis.\n");
+    return 0.0f;
   }
 
-  // 분석 구간: 실제 샘플과 FFT_SIZE 중 작은 쪽 (장시간 녹음 시 앞 구간 분석)
-  uint32_t captureSize = min(totalSamples, (uint32_t)FFT_SIZE);
-  if (captureSize < 64)
-  {
-    wavLog("[FFT] Too few samples (%u), skipping.\n", captureSize);
-    return;
-  }
-
-  // WAV 파일에서 PCM 샘플 읽기 (헤더 44바이트 스킵)
   File f = SD_MMC.open(wavFileName, FILE_READ);
   if (!f)
   {
     wavLog("[FFT] Cannot open %s\n", wavFileName);
-    return;
+    return 0.0f;
   }
-  f.seek(44);
 
-  float mean = 0.0f;
-  for (uint32_t i = 0; i < captureSize; i++)
+  // ── STEP1: 표준편차 최소 윈도우 탐색 ──────────────────────────────────────
+  float *tmpBuf = (float*)ps_malloc((size_t)sec_1 * sizeof(float));
+  if (!tmpBuf)  tmpBuf = (float*)malloc((size_t)sec_1 * sizeof(float));
+  if (!tmpBuf) { wavLog("[FFT] tmpBuf alloc fail\n"); f.close(); return 0.0f; }
+
+  float minStd  = 1e30f;
+  int   bestIdx = 0;
+  for (int i = 0; i < i_time; i++)
   {
-    int16_t s = 0;
-    f.read((uint8_t*)&s, 2);
-    fftReal[i] = (float)s;
-    mean += fftReal[i];
+    uint32_t startFrame = (uint32_t)(i + 1) * sec_0_1;
+    if (!wavReadSamples(f, startFrame, (uint32_t)sec_1, tmpBuf))
+    {
+      wavLog("[FFT] read error (i=%d)\n", i);
+      free(tmpBuf); f.close(); return 0.0f;
+    }
+    float s = stdAbsFloat(tmpBuf, sec_1);
+    if (s < minStd) { minStd = s; bestIdx = i; }
+  }
+  free(tmpBuf);
+
+  const int a = bestIdx + 1;
+
+  // ── STEP2: KissFFT (fftSize = 8000, 윈도우 함수 없음) ─────────────────────
+  float        *audioBuf = (float*)ps_malloc((size_t)fftSize * sizeof(float));
+  kiss_fft_cpx *fftIn    = (kiss_fft_cpx*)ps_malloc((size_t)fftSize * sizeof(kiss_fft_cpx));
+  kiss_fft_cpx *fftOut   = (kiss_fft_cpx*)ps_malloc((size_t)fftSize * sizeof(kiss_fft_cpx));
+  float        *mag      = (float*)ps_malloc((size_t)fftSize * sizeof(float));
+
+  if (!audioBuf) audioBuf = (float*)malloc((size_t)fftSize * sizeof(float));
+  if (!fftIn)    fftIn    = (kiss_fft_cpx*)malloc((size_t)fftSize * sizeof(kiss_fft_cpx));
+  if (!fftOut)   fftOut   = (kiss_fft_cpx*)malloc((size_t)fftSize * sizeof(kiss_fft_cpx));
+  if (!mag)      mag      = (float*)malloc((size_t)fftSize * sizeof(float));
+
+  if (!audioBuf || !fftIn || !fftOut || !mag)
+  {
+    wavLog("[FFT] FFT buffer alloc fail\n");
+    free(audioBuf); free(fftIn); free(fftOut); free(mag);
+    f.close(); return 0.0f;
+  }
+
+  const uint32_t fftStart = (uint32_t)a * sec_0_1;
+  if (!wavReadSamples(f, fftStart, (uint32_t)fftSize, audioBuf))
+  {
+    wavLog("[FFT] FFT window read fail\n");
+    free(audioBuf); free(fftIn); free(fftOut); free(mag);
+    f.close(); return 0.0f;
   }
   f.close();
-  mean /= (float)captureSize;
 
-  // DC 제거 + Hamming 윈도우 (실제 신호 구간에만 적용)
-  for (uint32_t i = 0; i < captureSize; i++)
+  for (int i = 0; i < fftSize; i++) { fftIn[i].r = audioBuf[i]; fftIn[i].i = 0.0f; }
+  free(audioBuf);
+
+  // cfg는 PSRAM에 배치 (twiddle 테이블 ~64KB)
+  size_t cfgLen = 0;
+  kiss_fft_alloc(fftSize, 0, NULL, &cfgLen);           // 필요 크기 산출
+  void *cfgMem = ps_malloc(cfgLen);
+  if (!cfgMem) cfgMem = malloc(cfgLen);
+  kiss_fft_cfg cfg = kiss_fft_alloc(fftSize, 0, cfgMem, &cfgLen);
+  if (!cfg)
   {
-    fftReal[i] -= mean;
-    fftReal[i] *= 0.54f - 0.46f * cosf(TWO_PI * i / (float)(captureSize - 1));
+    wavLog("[FFT] KissFFT cfg alloc fail\n");
+    free(cfgMem); free(fftIn); free(fftOut); free(mag);
+    return 0.0f;
   }
 
-  // 제로패딩 (captureSize < FFT_SIZE 인 경우)
-  if (captureSize < (uint32_t)FFT_SIZE)
-  {
-    memset(&fftReal[captureSize], 0, (FFT_SIZE - captureSize) * sizeof(float));
-  }
-  memset(fftImag, 0, FFT_SIZE * sizeof(float));
+  kiss_fft(cfg, fftIn, fftOut);
+  free(cfgMem);
+  free(fftIn);
 
-  // FFT 계산
-  ArduinoFFT<float> FFT(fftReal, fftImag, FFT_SIZE, (float)WAV_SAMPLE_RATE);
-  FFT.compute(FFTDirection::Forward);
-  FFT.complexToMagnitude();
+  // 크기 스펙트럼: |FFT[k]| = sqrt(re²+im²)  (Python: abs(fft(...)))
+  for (int i = 0; i < fftSize; i++)
+    mag[i] = sqrtf(fftOut[i].r * fftOut[i].r + fftOut[i].i * fftOut[i].i);
+  free(fftOut);
 
-  // 전기 노이즈 대역(59~61 Hz) 제거
-  {
-    uint32_t binLow  = (uint32_t)(59.0f * FFT_SIZE / WAV_SAMPLE_RATE);
-    uint32_t binHigh = (uint32_t)(61.0f * FFT_SIZE / WAV_SAMPLE_RATE) + 1;
-    for (uint32_t b = binLow; b <= binHigh && b < (uint32_t)(FFT_SIZE/2); b++)
-      fftReal[b] = 0.0f;
-  }
+  // ── STEP3: 저주파 제거 (Python: tfa_data3000[:50] = 0) ───────────────────
+  for (int i = 0; i < skipBins; i++) mag[i] = 0.0f;
 
-  float peakFreq = FFT.majorPeak();
+  // ── STEP4: 피크 탐색 (Python: idx = argmax(tfa_data3000)) ────────────────
+  int peakBin = skipBins;
+  for (int i = skipBins + 1; i < numBins; i++)
+    if (mag[i] > mag[peakBin]) peakBin = i;
+  const float peakFreqHz = (float)peakBin;   // 1 bin = 1 Hz
 
-  wavLog("─────────────────────────────────\n");
-  wavLog("[FFT] Signal   : %u samples (%.3f sec)\n",
-    captureSize, (float)captureSize / WAV_SAMPLE_RATE);
-  if (captureSize < totalSamples)
-    wavLog("[FFT] (analyzing first %u of %u total samples)\n", captureSize, totalSamples);
-  wavLog("[FFT] Zero-pad : %u → %u\n", captureSize, FFT_SIZE);
-  wavLog("[FFT] Freq Res : %.3f Hz/bin\n", (float)WAV_SAMPLE_RATE / (float)FFT_SIZE);
-  wavLog("[FFT] DC removed: %.1f\n", mean);
-  wavLog("[FFT] Peak Freq : %.2f Hz\n", peakFreq);
-  wavLog("─────────────────────────────────\n");
+  // ── STEP5: wave_energy = 피크 ±10 bins 평균 (Python: wave_energy) ────────
+  const int eStart = max(0, peakBin - ENERGY_HALF_WIN);
+  const int eStop  = min(numBins, peakBin + ENERGY_HALF_WIN);
+  float eSum = 0.0f;
+  for (int i = eStart; i < eStop; i++) eSum += mag[i];
+  const float waveEnergy = eSum / (float)(eStop - eStart);
+
+  // ── (보조) 표준편차 — Python: np.std(tfa_data) ───────────────────────────
+  float magSum = 0.0f;
+  for (int i = 0; i < numBins; i++) magSum += mag[i];
+  const float magMean = magSum / (float)numBins;
+  float varSum = 0.0f;
+  for (int i = 0; i < numBins; i++) { float d = mag[i] - magMean; varSum += d * d; }
+  const float stdDev = sqrtf(varSum / (float)numBins);
+
+  free(mag);
+
+  // ── 결과 출력 ─────────────────────────────────────────────────────────────
+  wavLog("---------------------------------\n");
+  wavLog("[FFT] Total      : %.2f sec (%u samples)\n",
+    (float)totalSamples / sr, totalSamples);
+  wavLog("[FFT] Analyze    : first %.2f sec (%d samples)\n",
+    (float)totalFr / sr, totalFr);
+  wavLog("[FFT] Window     : a=%d  std=%.6f  start=%.3f sec  (scan %d)\n",
+    a, minStd, (float)(a * sec_0_1) / sr, i_time);
+  wavLog("[FFT] FFT size   : %d  (res 1.000 Hz/bin)\n", fftSize);
+  wavLog("[FFT] Peak Freq  : %.0f Hz\n", peakFreqHz);
+  wavLog("[FFT] Intensity  : %.6f  (mean +-10 bins)\n", waveEnergy);
+  wavLog("[FFT] Std Dev    : %.6f\n", stdDev);
+  wavLog("---------------------------------\n");
+
+  return waveEnergy;
 }
 
 // ── WAV Header ────────────────────────────────────────────────────────────
@@ -367,15 +504,18 @@ static void wavStartRecording(bool sd)
 
   // WiFi는 계속 ON 유지 (방수 기구물 — 물리 버튼 접근 불가, 웹 전용 제어)
   // ADC1 (GPIO1)은 ESP32-S3에서 WiFi와 별도 하드웨어 블록 → 간섭 최소
-  // TX 파워 절감으로 VDD 리플 노이즈 추가 감소
-  esp_wifi_set_max_tx_power(40);            // 20dBm → 10dBm
-  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);       // Beacon DTIM 슬립 (TX 간격 증가)
+  // TX Power(10dBm) + WIFI_PS_MIN_MODEM은 webServerBegin()에서 전역 설정 — 여기서 재설정 불필요
 
   wavFillBuf  = 0;
   wavFillPos  = 0;
   wavFlushReq = false;
   wavISRCount = 0;
   wavStartMs  = millis();
+
+  // 포화 진단 통계 초기화
+  wavRawMin    = 4095;
+  wavRawMax    = 0;
+  wavClipCount = 0;
 
   // 필터 상태 초기화
   hpFilter.w1 = hpFilter.w2 = 0.0f;
@@ -397,7 +537,8 @@ static void wavStopRecording(bool sd)
   ledSetState(LED_BOOTING);
 
   webSetRecording(false);   // 웹 UI → REC 버튼으로 복귀
-  esp_wifi_set_ps(WIFI_PS_NONE);  // 슬립 해제 (응답 속도 복구)
+  // 녹음 종료 후 대기 상태로 복귀 — TX/PS 설정은 webServerBegin()에서 설정한 값 유지
+  // (10 dBm + WIFI_PS_MIN_MODEM → WIFI_PS_NONE으로 되돌리지 않음)
 
   if (!sd || !wavFile)
   {
@@ -428,7 +569,23 @@ static void wavStopRecording(bool sd)
 
   wavLog("[WAV] Total: %.2f sec (%u samples)\n", totalSec, totalSamples);
 
-  analyzeFFT(totalSamples);
+  // ── 포화(클리핑) 진단 출력 ───────────────────────────────────────────────
+  {
+    uint32_t totalAdc  = wavISRCount;
+    float    clipPct   = totalAdc ? (100.0f * (float)wavClipCount / (float)totalAdc) : 0.0f;
+    int      pcmMin    = (wavRawMin - 2048) << 4;   // ADC→PCM 환산 (참고)
+    int      pcmMax    = (wavRawMax - 2048) << 4;
+    wavLog("[ADC] Raw range : min=%d  max=%d  (valid 0~4095)\n", wavRawMin, wavRawMax);
+    wavLog("[ADC] PCM range : min=%d  max=%d  (16bit ±32768)\n", pcmMin, pcmMax);
+    wavLog("[ADC] Clipping  : %.2f%%  (%u / %u samples near rail +/-%d)\n",
+      clipPct, wavClipCount, totalAdc, WAV_CLIP_MARGIN);
+    if (clipPct >= 1.0f)
+      wavLog("[ADC] !! Saturation -- reduce preamp gain (intensity unreliable)\n");
+    else if (wavRawMin <= 50 || wavRawMax >= 4045)
+      wavLog("[ADC] ! Near full-scale -- insufficient headroom (reduce gain)\n");
+  }
+
+  analyzeFFT(totalSamples);   // KissFFT 주파수/강도 분석 (Intensity 출력)
 
 #if WAV_NORMALIZE
   normalizeWavFile(totalSamples);
@@ -545,6 +702,18 @@ void wavLoop(bool sd, unsigned long now)
         }
       }
 
+      // WAV 헤더 주기적 갱신 (5초마다) — 비정상 종료(전원차단/크래시) 대비
+      // closeWavFile()이 호출되지 않더라도 마지막 갱신 시점까지 데이터 복구 가능
+      static unsigned long lastHeaderUpdate = 0;
+      if (wavFile && (now - lastHeaderUpdate >= 5000))
+      {
+        lastHeaderUpdate = now;
+        uint32_t riffSize = 36 + wavDataBytes;
+        wavFile.seek(4);  wavFile.write((const uint8_t*)&riffSize,    4);
+        wavFile.seek(40); wavFile.write((const uint8_t*)&wavDataBytes, 4);
+        wavFile.seek(wavFile.size());  // 파일 끝으로 복귀 (다음 write 위치 유지)
+      }
+
       wavLog("  %.1f sec  (%u bytes)  SD free: %llu MB\n",
         elapsed,
         wavDataBytes,
@@ -558,6 +727,31 @@ void wavLoop(bool sd, unsigned long now)
       wavStopRecording(sd);
     }
   }
+
+  // ── DeepSleep: SLEEP_IDLE_SEC 동안 대기 상태 유지 시 슬립 진입 ────────────
+#if USE_DEEPSLEEP
+  {
+    static bool          inStandby  = false;
+    static unsigned long standbyMs  = 0;
+
+    if (wavState == WAV_STANDBY)
+    {
+      if (!inStandby) { inStandby = true; standbyMs = now; }
+
+      if ((now - standbyMs) >= (unsigned long)SLEEP_IDLE_SEC * 1000UL)
+      {
+        wavLog("[SLEEP] Standby for %d sec — attempting DeepSleep\n", SLEEP_IDLE_SEC);
+        deepSleepEnter();
+        // deepSleepEnter()가 반환된 경우(리드스위치 활성) → 타이머 리셋 후 재시도
+        standbyMs = now;
+      }
+    }
+    else
+    {
+      inStandby = false;  // 녹음/저장 중이면 타이머 리셋
+    }
+  }
+#endif
 }
 
 #endif // SENSOR_TYPE == 2
